@@ -1,0 +1,87 @@
+{% extends "base.html" %}
+
+{% block title %}Document #{{ document.id }} - LegiView{% endblock %}
+
+{% block content %}
+  <nav class="breadcrumbs" aria-label="Breadcrumb"><a href="{{ url_for('documents') }}">Documents</a><span>/</span>{% if bill %}<a href="{{ url_for('bill_detail', bill_id=bill.id) }}">{{ bill.bill_id_display or bill.bill_id_compact }}</a><span>/</span>{% endif %}<strong>#{{ document.id }}</strong></nav>
+
+  <section class="page-heading">
+    <div>
+      <p class="eyebrow">{{ document.session_key }} · {{ document.bill_id_display or document.bill_id_compact }} · {{ (document.document_kind or 'unknown')|replace('_', ' ') }}</p>
+      <h2>{{ document.title or document.exhibit_title or document.remote_filename or 'Untitled document' }}</h2>
+      <p class="heading-summary">Source record #{{ document.source_document_id or document.source_id or '—' }}</p>
+    </div>
+    <div class="action-row">
+      {% if document.local_action_url %}<a class="button-link primary" href="{{ document.local_action_url }}">Open archived file</a>{% endif %}
+      {% if document.reveal_action_url %}<a class="button-link" href="{{ document.reveal_action_url }}">Reveal file</a>{% endif %}
+      {% if document.source_url %}<a class="button-link" href="{{ document.source_url }}" target="_blank" rel="noopener">Open source</a>{% endif %}
+    </div>
+  </section>
+
+  <section class="stat-grid compact" aria-label="Document status">
+    <div class="stat"><span class="stat-label">Download status</span><strong><span class="status {{ document.download_status }}">{{ (document.download_status or 'unknown')|replace('_', ' ') }}</span></strong></div>
+    <div class="stat"><span class="stat-label">Attempts</span><strong>{{ document.attempt_count or 0 }}</strong></div>
+    <div class="stat"><span class="stat-label">Downloaded bytes</span><strong>{{ document.downloaded_bytes or document.byte_count or '—' }}</strong></div>
+    <div class="stat"><span class="stat-label">Validation</span><strong>{{ (document.validation_status or 'not checked')|replace('_', ' ') }}</strong></div>
+  </section>
+
+  {% if document.last_error %}<div class="message error"><strong>Last download error:</strong> {{ document.last_error }}{% if document.http_status %} (HTTP {{ document.http_status }}){% endif %}</div>{% endif %}
+
+  <section class="two-column-sections content-section">
+    <div class="detail-card">
+      <h3>Source Metadata</h3>
+      <table class="key-table"><tbody>
+        <tr><th>Session</th><td>{{ document.session_key }}</td></tr>
+        <tr><th>Bill</th><td>{{ document.bill_id_display or document.bill_id_compact or '—' }}</td></tr>
+        <tr><th>Kind</th><td>{{ (document.document_kind or 'unknown')|replace('_', ' ')|title }}</td></tr>
+        <tr><th>Source section</th><td>{{ (document.source_section or '—')|replace('_', ' ') }}</td></tr>
+        <tr><th>Source entity</th><td>{{ document.source_entity_type or '—' }}</td></tr>
+        <tr><th>Source numeric ID</th><td>{{ document.source_document_id or document.source_id or '—' }}</td></tr>
+        <tr><th>Raw document type</th><td>{{ document.raw_document_type or '—' }}</td></tr>
+        <tr><th>Exhibit reference</th><td>{{ document.exhibit_reference or '—' }}</td></tr>
+        <tr><th>Created</th><td>{{ document.source_created_at or '—' }}</td></tr>
+        <tr><th>Modified</th><td>{{ document.source_modified_at or '—' }}</td></tr>
+      </tbody></table>
+    </div>
+    <div class="detail-card">
+      <h3>People and Meeting</h3>
+      <table class="key-table"><tbody>
+        <tr><th>Submitter</th><td>{{ document.submitter or '—' }}</td></tr>
+        <tr><th>On behalf of</th><td>{{ document.on_behalf_of or '—' }}</td></tr>
+        <tr><th>Position</th><td>{% if document.position %}<span class="position {{ document.position|lower }}">{{ document.position }}</span>{% else %}—{% endif %}</td></tr>
+        <tr><th>City / organization</th><td>{{ document.city_organization or document.organization or '—' }}</td></tr>
+        <tr><th>Committee</th><td>{{ document.committee_name or document.committee_code or '—' }}</td></tr>
+        <tr><th>Meeting date</th><td>{{ document.meeting_date or '—' }}</td></tr>
+        <tr><th>Letter date</th><td>{{ document.letter_date or '—' }}</td></tr>
+        <tr><th>Chamber</th><td>{{ document.chamber or '—' }}</td></tr>
+      </tbody></table>
+    </div>
+  </section>
+
+  <section class="content-section detail-card">
+    <h3>Local Archive</h3>
+    <table class="key-table"><tbody>
+      <tr><th>Remote filename</th><td>{{ document.remote_filename or '—' }}</td></tr>
+      <tr><th>Local filename</th><td>{{ document.local_filename or '—' }}</td></tr>
+      <tr><th>Relative path</th><td><code class="path-code">{{ document.local_relative_path or document.relative_path or '—' }}</code></td></tr>
+      <tr><th>MIME type</th><td>{{ document.mime_type or '—' }}</td></tr>
+      <tr><th>Advertised bytes</th><td>{{ document.advertised_bytes or '—' }}</td></tr>
+      <tr><th>Downloaded bytes</th><td>{{ document.downloaded_bytes or '—' }}</td></tr>
+      <tr><th>SHA-256</th><td><code class="hash-code">{{ document.sha256 or '—' }}</code></td></tr>
+      <tr><th>Downloaded</th><td>{{ document.downloaded_at or '—' }}</td></tr>
+      <tr><th>Last seen</th><td>{{ document.last_seen_at or '—' }}</td></tr>
+    </tbody></table>
+  </section>
+
+  <section class="content-section">
+    <h2>Retained Versions</h2>
+    {% if versions %}
+      <div class="table-scroll"><table>
+        <thead><tr><th>Observed</th><th>Status</th><th>Filename</th><th>Bytes</th><th>MIME</th><th>SHA-256</th><th>ETag / Last-Modified</th></tr></thead>
+        <tbody>{% for version in versions %}<tr><td>{{ version.observed_at or version.created_at or '—' }}</td><td><span class="status {{ version.status }}">{{ (version.status or 'unknown')|replace('_', ' ') }}</span></td><td>{{ version.filename or version.local_filename or '—' }}</td><td>{{ version.byte_count or version.downloaded_bytes or '—' }}</td><td>{{ version.mime_type or '—' }}</td><td><code class="short-hash">{{ version.sha256 or '—' }}</code></td><td>{{ version.etag or version.last_modified or '—' }}</td></tr>{% endfor %}</tbody>
+      </table></div>
+    {% else %}
+      <p class="empty">No retained payload version is recorded.</p>
+    {% endif %}
+  </section>
+{% endblock %}

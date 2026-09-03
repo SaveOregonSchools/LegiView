@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "legiview"
+version = "0.1.0"
+description = "Durable local Oregon legislative data and document archive"
+requires-python = ">=3.11"
+license = "AGPL-3.0-only"
+dependencies = [
+  "Flask>=3.1,<4",
+  "beautifulsoup4>=4.13,<5",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8.4,<10"]
+
+[project.scripts]
+legiview = "olis_archive.__main__:main"
+
+[project.urls]
+Source = "https://github.com/SaveOregonSchools/LegiView"
+
+[tool.setuptools.packages.find]
+include = ["olis_archive*"]
+
+[tool.setuptools.package-data]
+olis_archive = ["migrations/*.sql", "templates/*.html", "static/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+markers = ["live: tests requiring direct Oregon Legislature network access"]

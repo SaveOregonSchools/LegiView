@@ -1,0 +1,55 @@
+{% extends "base.html" %}
+
+{% block title %}Retry Failures - LegiView{% endblock %}
+
+{% block content %}
+  <section class="page-heading">
+    <div>
+      <p class="eyebrow">Operations</p>
+      <h2>Retry Failed Downloads</h2>
+      <p class="heading-summary">Queue only retryable, interrupted, or missing-local document work. Valid completed files remain untouched.</p>
+    </div>
+    <a class="button-link" href="{{ url_for('runs') }}">Run history</a>
+  </section>
+
+  <section class="stat-grid compact" aria-label="Failure summary">
+    <div class="stat"><span class="stat-label">Retryable failures</span><strong>{{ stats.retryable_failures or rows|length or 0 }}</strong></div>
+    <div class="stat"><span class="stat-label">Terminal failures</span><strong>{{ stats.terminal_failures or 0 }}</strong></div>
+    <div class="stat"><span class="stat-label">Interrupted</span><strong>{{ stats.interrupted or 0 }}</strong></div>
+    <div class="stat"><span class="stat-label">Paused for space</span><strong>{{ stats.paused_low_space or 0 }}</strong></div>
+  </section>
+
+  <section class="tool-surface accent-operations">
+    <form method="get" action="{{ url_for('retry_failures') }}" class="filter-form">
+      <div><label for="run_id">Run ID</label><input id="run_id" name="run_id" type="number" min="1" value="{{ filters.run_id or '' }}"></div>
+      <div><label for="session">Session</label><input id="session" name="session" value="{{ filters.session or '' }}" placeholder="2026R1"></div>
+      <div><label for="bill">Bill</label><input id="bill" name="bill" value="{{ filters.bill or '' }}" placeholder="SB1501"></div>
+      <div class="form-actions"><button type="submit">Apply filters</button><a class="button-link" href="{{ url_for('retry_failures') }}">Clear</a></div>
+    </form>
+  </section>
+
+  <section class="content-section">
+    <div class="section-heading-row"><h2>Documents Needing Attention</h2><span class="status-note">Review the last error before retrying.</span></div>
+    {% if rows %}
+      <form method="post" action="{{ url_for('retry_failures') }}">
+        <input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
+        {% if filters.run_id %}<input type="hidden" name="run_id" value="{{ filters.run_id }}">{% endif %}
+        <div class="table-scroll"><table>
+          <thead><tr><th class="check-column"><span class="visually-hidden">Select</span></th><th>Session / Bill</th><th>Document</th><th>Status</th><th>Attempts</th><th>Last error</th><th>Last attempt</th></tr></thead>
+          <tbody>{% for row in rows %}<tr>
+            <td><input type="checkbox" name="document_ids" value="{{ row.id }}" aria-label="Select document {{ row.id }}" {% if row.retryable is not sameas false %}checked{% else %}disabled{% endif %}></td>
+            <td>{{ row.session_key }}<div>{{ row.bill_id_display or row.bill_id_compact }}</div></td>
+            <td><a class="record-link" href="{{ url_for('document_detail', document_id=row.id) }}">{{ row.title or row.remote_filename or 'Document #' ~ row.id }}</a><div class="table-note">{{ (row.document_kind or 'unknown')|replace('_', ' ') }}</div></td>
+            <td><span class="status {{ row.download_status }}">{{ (row.download_status or 'unknown')|replace('_', ' ') }}</span></td>
+            <td>{{ row.attempt_count or 0 }}</td>
+            <td class="error-text">{{ row.last_error or '—' }}{% if row.http_status %}<div class="table-note">HTTP {{ row.http_status }}</div>{% endif %}</td>
+            <td>{{ row.last_attempt_at or '—' }}</td>
+          </tr>{% endfor %}</tbody>
+        </table></div>
+        <div class="form-actions retry-actions"><button type="submit" name="action" value="selected">Queue selected retries</button><button class="secondary" type="submit" name="action" value="all">Queue all matching failures</button></div>
+      </form>
+    {% else %}
+      <div class="empty-state"><strong>No retryable documents match these filters.</strong><p>Completed documents are intentionally excluded.</p></div>
+    {% endif %}
+  </section>
+{% endblock %}

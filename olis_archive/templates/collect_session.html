@@ -1,0 +1,68 @@
+{% extends "base.html" %}
+
+{% block title %}Collect a Session - LegiView{% endblock %}
+
+{% block content %}
+  <section class="page-heading">
+    <div>
+      <p class="eyebrow">Legislative Collection</p>
+      <h2>Collect a Session</h2>
+      <p class="heading-summary">Collect House Bills and Senate Bills from one explicitly selected session.</p>
+    </div>
+    <a class="button-link" href="{{ url_for('runs') }}">Run history</a>
+  </section>
+
+  <div class="notice warning-note">
+    <strong>Keep validation runs bounded.</strong>
+    <span>Session collection may discover many documents. Use a bill limit while validating configuration and archive capacity.</span>
+  </div>
+
+  <section class="tool-surface accent-collection">
+    <form method="post" action="{{ url_for('collect_session') }}" class="collection-form">
+      <input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
+      <div>
+        <label for="session_key">Legislative session</label>
+        <input id="session_key" name="session_key" list="session-options" value="{{ selected_session or '' }}" placeholder="2026R1" required autocomplete="off">
+        <datalist id="session-options">
+          {% for session in sessions %}
+            {% set session_value = session.session_key or session.key or session %}
+            <option value="{{ session_value }}">{{ session.session_name or session.name or session_value }}</option>
+          {% endfor %}
+        </datalist>
+      </div>
+      <div>
+        <label for="max_bills">Maximum bills <span class="optional">optional</span></label>
+        <input id="max_bills" name="max_bills" type="number" min="1" value="{{ max_bills or '' }}" placeholder="For example, 10">
+        <p class="field-note">Leave blank only when you intend to collect the complete selected session.</p>
+      </div>
+      <div class="form-actions full">
+        <button type="submit">Queue session collection</button>
+        <a class="button-link" href="{{ url_for('settings') }}">Review settings</a>
+      </div>
+    </form>
+  </section>
+
+  <section class="guidance-card collection-guidance">
+    <h3>Responsible source use</h3>
+    <p>LegiView uses filtered OData requests, conservative worker counts, request pacing, and durable progress so a stopped run can resume without repeating completed work. It does not provide a multi-year backfill orchestrator in Phase 1.</p>
+    <p class="guidance-note">The operator remains responsible for accepting and following the Oregon Legislature Open Data acceptable-use agreement.</p>
+  </section>
+
+  {% if recent_runs %}
+    <section class="content-section">
+      <div class="section-heading-row"><h2>Recent Session Runs</h2><a class="text-link" href="{{ url_for('runs') }}">All runs</a></div>
+      <div class="table-scroll"><table>
+        <thead><tr><th>Run</th><th>Session</th><th>Status</th><th>Stage</th><th>Bills</th><th>Errors</th><th>Started</th></tr></thead>
+        <tbody>{% for run in recent_runs %}<tr>
+          <td><a href="{{ url_for('run_detail', run_id=run.id) }}">#{{ run.id }}</a></td>
+          <td>{{ run.session_key or run.scope_display or '—' }}</td>
+          <td><span class="status {{ run.status }}">{{ (run.status or 'unknown')|replace('_', ' ') }}</span></td>
+          <td>{{ (run.stage or '—')|replace('_', ' ') }}</td>
+          <td>{{ run.bills_completed or run.items_completed or 0 }} / {{ run.bills_planned or run.items_total or 0 }}</td>
+          <td>{{ run.error_count or run.errors or 0 }}</td>
+          <td>{{ run.started_at or run.queued_at or '—' }}</td>
+        </tr>{% endfor %}</tbody>
+      </table></div>
+    </section>
+  {% endif %}
+{% endblock %}

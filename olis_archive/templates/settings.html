@@ -1,0 +1,63 @@
+{% extends "base.html" %}
+
+{% block title %}Settings - LegiView{% endblock %}
+
+{% block content %}
+  <section class="page-heading">
+    <div>
+      <p class="eyebrow">Configuration</p>
+      <h2>Settings</h2>
+      <p class="heading-summary">Use conservative source concurrency and keep the payload archive outside the repository for normal operation.</p>
+    </div>
+    <a class="button-link" href="{{ url_for('help_page') }}#settings-help">Settings help</a>
+  </section>
+
+  <section class="tool-surface accent-config">
+    <form method="post" action="{{ url_for('settings') }}" class="settings-form">
+      <input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
+      <div class="full">
+        <label for="archive_root">Archive root</label>
+        <input id="archive_root" name="archive_root" value="{{ settings.archive_root or '' }}" required spellcheck="false">
+        <p class="field-note">Files are retained under <code>&lt;archive root&gt;/&lt;session&gt;/&lt;bill&gt;/&lt;kind&gt;/&lt;source id&gt;/</code>.</p>
+      </div>
+      <div>
+        <label for="request_timeout">Request timeout (seconds)</label>
+        <input id="request_timeout" name="request_timeout" type="number" min="1" max="600" step="0.5" value="{{ settings.request_timeout or 30 }}" required>
+      </div>
+      <div>
+        <label for="inter_request_delay">Inter-request delay (seconds)</label>
+        <input id="inter_request_delay" name="inter_request_delay" type="number" min="0" max="60" step="0.05" value="{{ settings.inter_request_delay if settings.inter_request_delay is not none else 0.25 }}" required>
+      </div>
+      <div>
+        <label for="odata_worker_count">OData workers</label>
+        <input id="odata_worker_count" name="odata_worker_count" type="number" min="1" max="4" value="{{ settings.odata_worker_count or 1 }}" required>
+        <p class="field-note">Metadata and structured-source requests. Default: 1.</p>
+      </div>
+      <div>
+        <label for="download_worker_count">Document download workers</label>
+        <input id="download_worker_count" name="download_worker_count" type="number" min="1" max="8" value="{{ settings.download_worker_count or 2 }}" required>
+        <p class="field-note">Bounded background downloads. Default: 2.</p>
+      </div>
+      <div>
+        <label for="html_request_concurrency">OLIS HTML concurrency</label>
+        <input id="html_request_concurrency" name="html_request_concurrency" type="number" min="1" max="2" value="{{ settings.html_request_concurrency or 1 }}" required>
+        <p class="field-note">Known testimony pages only. Default: 1.</p>
+      </div>
+      <div>
+        <label for="minimum_free_space_bytes">Minimum free-space floor (bytes)</label>
+        <input id="minimum_free_space_bytes" name="minimum_free_space_bytes" type="number" min="0" max="1000000000000000" step="1" value="{{ settings.minimum_free_space_bytes if settings.minimum_free_space_bytes is not none else 1073741824 }}" required>
+        <p class="field-note">Downloads pause before violating this floor. 1 GiB = 1,073,741,824 bytes.</p>
+      </div>
+      <div class="form-actions full"><button type="submit">Save settings</button><a class="button-link" href="{{ url_for('home') }}">Cancel</a></div>
+    </form>
+  </section>
+
+  <div class="notice content-section"><strong>Restart to apply changes.</strong><span>The current archive root and worker graph stay fixed until LegiView exits safely. Run records retain their configuration snapshots for audit.</span></div>
+
+  <section class="two-column-sections content-section">
+    <div class="detail-card"><h3>Database</h3><p class="path-value"><code>{{ settings.database_path or database_path or 'Configured by LEGIVIEW_DATABASE_PATH' }}</code></p><p class="status-note">Structured records, run state, errors, and provenance are stored in SQLite.</p></div>
+    <div class="detail-card"><h3>Network identity</h3><p class="path-value"><code>{{ settings.user_agent or user_agent or 'OLISArchive/&lt;version&gt; (+https://www.saveoregonschools.com/)' }}</code></p><p class="status-note">LegiView honors throttling and <code>Retry-After</code>; raising concurrency is rarely useful.</p></div>
+  </section>
+
+  <div class="notice warning-note content-section"><strong>Downloaded files are untrusted.</strong><span>LegiView validates and archives payloads but does not provide antivirus scanning in Phase 1. Keep operating-system security software enabled before opening files.</span></div>
+{% endblock %}

@@ -1,0 +1,66 @@
+{% extends "base.html" %}
+
+{% block title %}Collect a Bill - LegiView{% endblock %}
+
+{% block content %}
+  <section class="page-heading">
+    <div>
+      <p class="eyebrow">Legislative Collection</p>
+      <h2>Collect a Bill</h2>
+      <p class="heading-summary">Queue one durable collection run using the same service used by the command line.</p>
+    </div>
+    <a class="button-link" href="{{ url_for('runs') }}">Run history</a>
+  </section>
+
+  <section class="tool-surface accent-collection">
+    <form method="post" action="{{ url_for('collect_bill') }}" class="collection-form">
+      <input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
+      <div>
+        <label for="session_key">Legislative session</label>
+        <input id="session_key" name="session_key" list="session-options" value="{{ selected_session or '' }}" placeholder="2026R1" required autocomplete="off">
+        <datalist id="session-options">
+          {% for session in sessions %}
+            {% set session_value = session.session_key or session.key or session %}
+            <option value="{{ session_value }}">{{ session.session_name or session.name or session_value }}</option>
+          {% endfor %}
+        </datalist>
+        <p class="field-note">Use the official key, such as <code>2026R1</code>.</p>
+      </div>
+      <div>
+        <label for="bill_id">Bill</label>
+        <input id="bill_id" name="bill_id" value="{{ bill_id or '' }}" placeholder="SB1501 or SB 1501" autocomplete="off" pattern="[HhSs][Bb]\s*[0-9]+" required>
+        <p class="field-note">Phase 1 accepts House Bills and Senate Bills only.</p>
+      </div>
+      <div class="form-actions full">
+        <button type="submit">Queue bill collection</button>
+        <a class="button-link" href="{{ url_for('bills') }}">Browse existing bills</a>
+      </div>
+    </form>
+  </section>
+
+  <section class="guidance-card collection-guidance">
+    <h3>What this run collects</h3>
+    <ol class="workflow-steps">
+      <li><div><strong>Official bill metadata and references</strong><p>Session, measure, sponsors, legislators, committees, meetings, and agenda context come from filtered OData queries.</p></div></li>
+      <li><div><strong>Document discovery and normalization</strong><p>LegiView reconciles modern testimony HTML with OData and preserves historical presentation classifications.</p></div></li>
+      <li><div><strong>Validated file retention</strong><p>Downloads stream through <code>.part</code> files, are hashed, validated, and finalized without replacing a valid prior version.</p></div></li>
+    </ol>
+  </section>
+
+  {% if recent_runs %}
+    <section class="content-section">
+      <div class="section-heading-row"><h2>Recent Bill Runs</h2><a class="text-link" href="{{ url_for('runs') }}">All runs</a></div>
+      <div class="table-scroll"><table>
+        <thead><tr><th>Run</th><th>Scope</th><th>Status</th><th>Stage</th><th>Downloaded</th><th>Started</th></tr></thead>
+        <tbody>{% for run in recent_runs %}<tr>
+          <td><a href="{{ url_for('run_detail', run_id=run.id) }}">#{{ run.id }}</a></td>
+          <td>{{ run.scope_display or run.requested_scope or '—' }}</td>
+          <td><span class="status {{ run.status }}">{{ (run.status or 'unknown')|replace('_', ' ') }}</span></td>
+          <td>{{ (run.stage or '—')|replace('_', ' ') }}</td>
+          <td>{{ run.documents_downloaded or 0 }} / {{ run.documents_discovered or 0 }}</td>
+          <td>{{ run.started_at or run.queued_at or '—' }}</td>
+        </tr>{% endfor %}</tbody>
+      </table></div>
+    </section>
+  {% endif %}
+{% endblock %}

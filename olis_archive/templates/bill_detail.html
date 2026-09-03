@@ -1,0 +1,134 @@
+{% extends "base.html" %}
+
+{% block title %}{{ bill.bill_id_display or bill.bill_id_compact }} - LegiView{% endblock %}
+
+{% block content %}
+  <nav class="breadcrumbs" aria-label="Breadcrumb"><a href="{{ url_for('bills') }}">Bills</a><span>/</span><span>{{ bill.session_key }}</span><span>/</span><strong>{{ bill.bill_id_display or bill.bill_id_compact }}</strong></nav>
+
+  <section class="page-heading bill-heading">
+    <div>
+      <p class="eyebrow">{{ bill.session_name or bill.session_key }} · {{ bill.bill_chamber or bill.chamber }}</p>
+      <h2>{{ bill.bill_id_display or bill.bill_id_compact }}</h2>
+      <p class="heading-summary">{{ bill.bill_title or bill.relating_to or 'No bill title supplied by the source.' }}</p>
+    </div>
+    <div class="action-row">
+      {% if bill.source_url %}<a class="button-link" href="{{ bill.source_url }}" target="_blank" rel="noopener">Open in OLIS</a>{% endif %}
+      <a class="button-link primary" href="{{ url_for('collect_bill') }}?session_key={{ bill.session_key }}&bill_id={{ bill.bill_id_compact }}">Collect again</a>
+    </div>
+  </section>
+
+  <section class="bill-summary-card">
+    <div class="summary-section full-width">
+      <span class="summary-label">Bill Title</span>
+      <p>{{ bill.bill_title or bill.relating_to or '—' }}</p>
+    </div>
+    <div class="summary-section full-width">
+      <span class="summary-label">Catchline</span>
+      <p>{{ bill.catchline or '—' }}</p>
+    </div>
+    <div class="summary-section full-width">
+      <span class="summary-label">Summary</span>
+      <p class="preserve-lines">{{ bill.measure_summary or bill.summary or '—' }}</p>
+    </div>
+    <div class="summary-section full-width">
+      <span class="summary-label">At the request of</span>
+      <p>{{ bill.at_the_request_of or '—' }}</p>
+    </div>
+  </section>
+
+  {% set chiefs = chief_sponsors or bill.chief_sponsors or [] %}
+  {% set regulars = regular_sponsors or bill.regular_sponsors or [] %}
+  <section class="two-column-sections content-section">
+    <div class="detail-card">
+      <h3>Chief Sponsors</h3>
+      {% if chiefs %}<div class="chip-list">{% for sponsor in chiefs %}<span class="chip">{{ sponsor.display_name or sponsor.name or sponsor.legislator_code or sponsor.committee_code or 'Unknown sponsor' }}</span>{% endfor %}</div>{% else %}<p class="empty">None listed.</p>{% endif %}
+    </div>
+    <div class="detail-card">
+      <h3>Regular Sponsors</h3>
+      {% if regulars %}<div class="chip-list">{% for sponsor in regulars %}<span class="chip">{{ sponsor.display_name or sponsor.name or sponsor.legislator_code or sponsor.committee_code or sponsor.presession_filed_message or 'Unknown sponsor' }}</span>{% endfor %}</div>{% else %}<p class="empty">None listed.</p>{% endif %}
+    </div>
+  </section>
+
+  {% if filing_notices or unmapped_sponsors %}
+    <section class="content-section detail-card">
+      <h3>Filing Notices and Unmapped Sponsor Records</h3>
+      {% if filing_notices %}
+        <ul class="help-list">{% for sponsor in filing_notices %}<li>{{ sponsor.pre_session_filed_message }}</li>{% endfor %}</ul>
+      {% endif %}
+      {% if unmapped_sponsors %}
+        <div class="chip-list">{% for sponsor in unmapped_sponsors %}<span class="chip">{{ sponsor.display_name or sponsor.legislator_code or sponsor.committee_code or 'Unknown sponsor' }} · {{ sponsor.raw_sponsor_type or 'unknown type' }} / {{ sponsor.raw_sponsor_level or 'unknown level' }}</span>{% endfor %}</div>
+      {% endif %}
+    </section>
+  {% endif %}
+
+  <section class="content-section">
+    <div class="section-heading-row"><h2>Measure Details</h2><span class="status-note">Last synced {{ bill.last_synced_at or '—' }}</span></div>
+    <div class="facts-grid">
+      <div><span>Session</span><strong>{{ bill.session_key }}</strong></div>
+      <div><span>Chamber</span><strong>{{ bill.bill_chamber or bill.chamber or '—' }}</strong></div>
+      <div><span>Chapter Number</span><strong>{{ bill.chapter_number or '—' }}</strong></div>
+      <div><span>Effective Date</span><strong>{{ bill.effective_date or '—' }}</strong></div>
+      <div><span>Current Version</span><strong>{{ bill.current_version or '—' }}</strong></div>
+      <div><span>Emergency Clause</span><strong>{% if bill.emergency_clause in [1, '1', true, 'true', 'True'] %}Yes{% elif bill.emergency_clause in [0, '0', false, 'false', 'False'] %}No{% else %}—{% endif %}</strong></div>
+      <div><span>Vetoed</span><strong>{% if bill.vetoed in [1, '1', true, 'true', 'True'] %}Yes{% elif bill.vetoed in [0, '0', false, 'false', 'False'] %}No{% else %}—{% endif %}</strong></div>
+      <div><span>Current Location</span><strong>{{ bill.current_location or '—' }}</strong></div>
+    </div>
+    <details class="source-details">
+      <summary>Source and audit fields</summary>
+      <table class="key-table"><tbody>
+        <tr><th>Relating To</th><td>{{ bill.relating_to or '—' }}</td></tr>
+        <tr><th>Relating To Full</th><td>{{ bill.relating_to_full or '—' }}</td></tr>
+        <tr><th>Current Committee</th><td>{{ bill.current_committee_name or bill.current_committee_code or '—' }}</td></tr>
+        <tr><th>OData created</th><td>{{ bill.source_created_at or bill.created_date or '—' }}</td></tr>
+        <tr><th>OData modified</th><td>{{ bill.source_modified_at or bill.modified_date or '—' }}</td></tr>
+        <tr><th>First collected</th><td>{{ bill.first_collected_at or '—' }}</td></tr>
+        <tr><th>Last synced</th><td>{{ bill.last_synced_at or '—' }}</td></tr>
+      </tbody></table>
+    </details>
+  </section>
+
+  {% if agenda_items %}
+    <section class="content-section">
+      <h2>Committee Context</h2>
+      <div class="table-scroll"><table>
+        <thead><tr><th>Meeting</th><th>Committee</th><th>Type</th><th>Details</th></tr></thead>
+        <tbody>{% for item in agenda_items %}<tr><td>{{ item.meeting_date or '—' }}</td><td>{{ item.committee_name or item.committee_code or '—' }}</td><td>{{ item.agenda_item_type or '—' }}</td><td>{{ item.description or '—' }}</td></tr>{% endfor %}</tbody>
+      </table></div>
+    </section>
+  {% endif %}
+
+  {% set groups = document_groups or {} %}
+  {% set sections = [
+    ('public_testimony', 'Submitted Written Testimony'),
+    ('legacy_testimony', 'Legacy Testimony'),
+    ('committee_presentation', 'Presentations Displayed in Committee'),
+    ('floor_letter', 'Floor Letters'),
+    ('committee_document_other', 'Other Committee Documents'),
+    ('unknown', 'Unclassified Documents')
+  ] %}
+  <section class="content-section">
+    <div class="section-heading-row"><h2>Documents</h2><a class="text-link" href="{{ url_for('documents') }}?session={{ bill.session_key }}&bill={{ bill.bill_id_compact }}">Open in document browser</a></div>
+    <div class="document-groups">
+      {% for key, label in sections %}
+        {% set group_rows = groups.get(key, []) %}
+        {% if group_rows %}
+          <section class="document-group">
+            <div class="document-group-heading"><h3>{{ label }}</h3><span>{{ group_rows|length }}</span></div>
+            <div class="table-scroll"><table>
+              <thead><tr><th>Title</th><th>Submitter / Position</th><th>Meeting / Committee</th><th>Status</th><th>File</th><th>Source</th></tr></thead>
+              <tbody>{% for document in group_rows %}<tr>
+                <td><a class="record-link" href="{{ url_for('document_detail', document_id=document.id) }}">{{ document.title or document.exhibit_title or document.remote_filename or 'Untitled document' }}</a>{% if document.raw_document_type %}<div class="table-note">{{ document.raw_document_type }}</div>{% endif %}</td>
+                <td>{{ document.submitter or '—' }}{% if document.position %}<div><span class="position {{ document.position|lower }}">{{ document.position }}</span></div>{% endif %}{% if document.on_behalf_of %}<div class="table-note">For {{ document.on_behalf_of }}</div>{% endif %}</td>
+                <td>{{ document.meeting_date or document.letter_date or '—' }}<div class="table-note">{{ document.committee_name or document.committee_code or document.chamber or '' }}</div></td>
+                <td><span class="status {{ document.download_status }}">{{ (document.download_status or 'unknown')|replace('_', ' ') }}</span></td>
+                <td>{{ document.local_filename or document.remote_filename or '—' }}{% if document.downloaded_bytes or document.byte_count %}<div class="table-note">{{ (document.downloaded_bytes or document.byte_count)|human_bytes }}</div>{% endif %}</td>
+                <td>{% if document.local_action_url %}<a href="{{ document.local_action_url }}">Local file</a>{% endif %}{% if document.source_url %}{% if document.local_action_url %}<span aria-hidden="true"> · </span>{% endif %}<a href="{{ document.source_url }}" target="_blank" rel="noopener">OLIS</a>{% elif not document.local_action_url %}—{% endif %}</td>
+              </tr>{% endfor %}</tbody>
+            </table></div>
+          </section>
+        {% endif %}
+      {% endfor %}
+      {% if not groups %}<div class="empty-state"><strong>No documents discovered.</strong><p>Run collection again to refresh this bill's source records.</p></div>{% endif %}
+    </div>
+  </section>
+{% endblock %}

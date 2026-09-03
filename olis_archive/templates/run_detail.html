@@ -1,0 +1,100 @@
+{% extends "base.html" %}
+
+{% block title %}Collection Run #{{ run.id }} - LegiView{% endblock %}
+{% block head_extra %}{% if run.status in ['queued', 'running'] %}<meta http-equiv="refresh" content="15">{% endif %}{% endblock %}
+
+{% block content %}
+  <nav class="breadcrumbs" aria-label="Breadcrumb"><a href="{{ url_for('runs') }}">Run History</a><span>/</span><strong>#{{ run.id }}</strong></nav>
+
+  <section class="page-heading">
+    <div>
+      <p class="eyebrow">{{ (run.run_type or run.type or 'collection')|replace('_', ' ') }}</p>
+      <h2>Collection Run #{{ run.id }}</h2>
+      <p class="heading-summary">{{ run.scope_display or run.requested_scope or 'No scope recorded' }}</p>
+    </div>
+    <div class="action-row">
+      <a class="button-link" href="{{ url_for('run_detail', run_id=run.id) }}">Refresh</a>
+      {% if run.status in ['queued', 'running', 'paused', 'interrupted'] %}<form class="inline-form" method="post" action="{{ url_for('cancel_run', run_id=run.id) }}"><input type="hidden" name="_csrf_token" value="{{ csrf_token() }}"><button class="secondary" type="submit">Cancel</button></form>{% endif %}
+      {% if run.status in ['paused', 'interrupted'] %}<form class="inline-form" method="post" action="{{ url_for('resume_run', run_id=run.id) }}"><input type="hidden" name="_csrf_token" value="{{ csrf_token() }}"><button type="submit">Resume</button></form>{% endif %}
+      {% if run.error_count or run.errors %}<a class="button-link primary" href="{{ url_for('retry_failures') }}?run_id={{ run.id }}">Review failures</a>{% endif %}
+    </div>
+  </section>
+
+  {% if run.status in ['queued', 'running'] %}<div class="notice live-note"><span class="pulse-dot" aria-hidden="true"></span><span>This active-run page refreshes every 15 seconds. Progress is read from persisted stage records.</span></div>{% endif %}
+  {% if run.error_message %}<div class="message error">{{ run.error_message }}</div>{% endif %}
+
+  <section class="stat-grid compact" aria-label="Run status">
+    <div class="stat"><span class="stat-label">Status</span><strong><span class="status {{ run.status }}">{{ (run.status or 'unknown')|replace('_', ' ') }}</span></strong></div>
+    <div class="stat"><span class="stat-label">Current stage</span><strong class="stat-date">{{ (run.stage or '—')|replace('_', ' ') }}</strong></div>
+    <div class="stat"><span class="stat-label">Bills/items</span><strong>{{ run.items_completed or run.bills_completed or 0 }} / {{ run.items_total or run.bills_planned or 0 }}</strong></div>
+    <div class="stat"><span class="stat-label">Documents discovered</span><strong>{{ run.documents_discovered or 0 }}</strong></div>
+    <div class="stat"><span class="stat-label">Documents downloaded</span><strong>{{ run.documents_downloaded or 0 }}</strong></div>
+    <div class="stat"><span class="stat-label">Skipped valid</span><strong>{{ run.documents_skipped or run.skipped_count or 0 }}</strong></div>
+    <div class="stat"><span class="stat-label">Failures</span><strong>{{ run.error_count or run.errors or 0 }}</strong></div>
+    <div class="stat"><span class="stat-label">Elapsed</span><strong class="stat-date">{{ elapsed or run.elapsed or '—' }}</strong></div>
+  </section>
+
+  <section class="two-column-sections content-section">
+    <div class="detail-card">
+      <h3>Run Request</h3>
+      <table class="key-table"><tbody>
+        <tr><th>Type</th><td>{{ (run.run_type or run.type or '—')|replace('_', ' ') }}</td></tr>
+        <tr><th>Session</th><td>{{ run.session_key or '—' }}</td></tr>
+        <tr><th>Bill</th><td>{{ run.bill_id_display or run.bill_id_compact or '—' }}</td></tr>
+        <tr><th>Maximum bills</th><td>{{ run.max_bills or 'Not limited' }}</td></tr>
+        <tr><th>Current activity</th><td>{{ run.current_activity or '—' }}</td></tr>
+      </tbody></table>
+    </div>
+    <div class="detail-card">
+      <h3>Timing</h3>
+      <table class="key-table"><tbody>
+        <tr><th>Queued</th><td>{{ run.queued_at or '—' }}</td></tr>
+        <tr><th>Started</th><td>{{ run.started_at or '—' }}</td></tr>
+        <tr><th>Finished</th><td>{{ run.finished_at or '—' }}</td></tr>
+        <tr><th>Updated</th><td>{{ run.updated_at or '—' }}</td></tr>
+        <tr><th>Cancel requested</th><td>{{ 'Yes' if run.cancel_requested else 'No' }}</td></tr>
+      </tbody></table>
+    </div>
+  </section>
+
+  <section class="content-section">
+    <h2>Collection Stages</h2>
+    {% if stages %}
+      <ol class="stage-list">
+        {% for stage in stages %}
+          <li class="stage-row {{ stage.status }}">
+            <span class="stage-marker" aria-hidden="true"></span>
+            <div><strong>{{ (stage.label or stage.name)|replace('_', ' ')|title }}</strong>{% if stage.detail or stage.message %}<p>{{ stage.detail or stage.message }}</p>{% endif %}</div>
+            <span class="status {{ stage.status }}">{{ (stage.status or 'pending')|replace('_', ' ') }}</span>
+          </li>
+        {% endfor %}
+      </ol>
+    {% else %}
+      <div class="current-stage"><span>Current persisted stage</span><strong>{{ (run.stage or 'queued')|replace('_', ' ')|title }}</strong></div>
+    {% endif %}
+  </section>
+
+  <section class="content-section">
+    <h2>Run Items</h2>
+    {% if items %}
+      <div class="table-scroll"><table>
+        <thead><tr><th>Bill / Document</th><th>Stage</th><th>Status</th><th>Attempts</th><th>Message</th><th>Updated</th></tr></thead>
+        <tbody>{% for item in items %}<tr><td>{{ item.label or item.bill_id_display or item.document_title or item.source_document_id or '—' }}</td><td>{{ (item.stage or '—')|replace('_', ' ') }}</td><td><span class="status {{ item.status }}">{{ (item.status or 'unknown')|replace('_', ' ') }}</span></td><td>{{ item.attempt_count or 0 }}</td><td>{{ item.message or item.error_message or '—' }}</td><td>{{ item.updated_at or item.finished_at or '—' }}</td></tr>{% endfor %}</tbody>
+      </table></div>
+    {% else %}<p class="empty">No per-item work has been recorded.</p>{% endif %}
+  </section>
+
+  <section class="content-section">
+    <div class="section-heading-row"><h2>Errors</h2>{% if errors %}<a class="text-link" href="{{ url_for('retry_failures') }}?run_id={{ run.id }}">Review failed downloads</a>{% endif %}</div>
+    {% if errors %}
+      <div class="table-scroll"><table>
+        <thead><tr><th>Stage</th><th>Source identity</th><th>Class</th><th>Retryable</th><th>Message</th><th>Attempts</th><th>Source</th><th>Last occurrence</th></tr></thead>
+        <tbody>{% for error in errors %}<tr><td>{{ (error.stage or '—')|replace('_', ' ') }}</td><td>{% if error.session_key %}{{ error.session_key }}{% endif %}{% if error.bill_id_compact %} / {{ error.bill_id_compact }}{% endif %}{% if error.source_entity_type or error.source_id %}<div class="table-note">{{ error.source_entity_type or 'document' }} #{{ error.source_id or error.document_id or '—' }}</div>{% elif error.document_id %}<div class="table-note">Local document #{{ error.document_id }}</div>{% elif not error.session_key and not error.bill_id_compact %}—{% endif %}</td><td>{{ error.error_class or '—' }}</td><td>{{ 'Yes' if error.retryable else 'No' }}</td><td>{{ error.message or '—' }}</td><td>{{ error.attempt_count or 1 }}</td><td>{% if error.source_url %}<a href="{{ error.source_url }}" target="_blank" rel="noopener">Official source</a>{% else %}—{% endif %}</td><td>{{ error.last_occurred_at or error.updated_at or '—' }}</td></tr>{% endfor %}</tbody>
+      </table></div>
+    {% else %}<div class="empty-state compact-empty"><strong>No errors recorded for this run.</strong></div>{% endif %}
+  </section>
+
+  {% if config_snapshot %}
+    <section class="content-section"><details class="source-details"><summary>Configuration snapshot</summary><table class="key-table"><tbody>{% for key, value in config_snapshot.items() %}<tr><th>{{ key|replace('_', ' ')|title }}</th><td>{{ value }}</td></tr>{% endfor %}</tbody></table></details></section>
+  {% endif %}
+{% endblock %}

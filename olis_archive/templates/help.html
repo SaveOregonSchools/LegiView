@@ -1,0 +1,75 @@
+{% extends "base.html" %}
+
+{% block title %}Help and Data Sources - LegiView{% endblock %}
+
+{% block content %}
+  <section class="page-heading help-heading">
+    <div>
+      <p class="eyebrow">Configuration</p>
+      <h2>Help and Data Sources</h2>
+      <p class="help-summary">LegiView is a local, provenance-first archive for Oregon House Bills and Senate Bills. Phase 1 collects one bill or one explicitly selected session and retains validated source files without destructive mirroring.</p>
+    </div>
+  </section>
+
+  <nav class="subnav" aria-label="Help topics"><a href="#collecting">Collecting</a><a href="#runs">Runs and retry</a><a href="#archive">Archive safety</a><a href="#sources">Official sources</a><a href="#settings-help">Settings</a><a href="#limits">Phase 1 limits</a></nav>
+
+  <section class="help-section" id="collecting">
+    <h3>Collecting a Bill</h3>
+    <ol class="workflow-steps">
+      <li><div><strong>Choose the official session and bill.</strong><p>Enter a session key such as <code>2026R1</code> and an HB/SB identifier such as <code>SB1501</code>.</p></div></li>
+      <li><div><strong>Follow the durable run.</strong><p>The run detail page shows explicit stages from session/reference loading through discovery, download, and finalization.</p></div></li>
+      <li><div><strong>Review the archived bill.</strong><p>Bill detail separates chief and regular sponsors and groups testimony, presentations, floor letters, and other committee documents.</p></div></li>
+      <li><div><strong>Retry only what failed.</strong><p>Completed files that still exist and validate are skipped; retry does not require recollecting the entire bill.</p></div></li>
+    </ol>
+    <div class="action-row"><a class="button-link primary" href="{{ url_for('collect_bill') }}">Collect a bill</a><a class="button-link" href="{{ url_for('collect_session') }}">Collect a session</a></div>
+  </section>
+
+  <section class="help-section" id="runs">
+    <h3>Runs, Restarts, and Retry</h3>
+    <p>Collection and downloading happen in bounded background workers, not inside the browser request. Run state, current stage, counters, work items, and errors are persisted. If the process stops, work that had been active is normalized to an interrupted state rather than left falsely running.</p>
+    <p>Use <a href="{{ url_for('runs') }}">Run History</a> to inspect progress. Use <a href="{{ url_for('retry_failures') }}">Retry Failures</a> for retryable HTTP failures, interrupted downloads, low-space pauses after space is restored, or files later found missing locally.</p>
+  </section>
+
+  <section class="help-section" id="archive">
+    <h3>Archive Layout and File Safety</h3>
+    <div class="folder-callout"><span>Example</span><code>&lt;archive_root&gt;/2026R1/SB1501/public_testimony/244133/document.pdf</code></div>
+    <ul class="help-list">
+      <li>Downloads stream into a <code>.part</code> staging file and are atomically finalized only after validation.</li>
+      <li>Every completed payload records byte count, MIME information, SHA-256, and a relative archive path.</li>
+      <li>A changed payload is retained as another document version; earlier bytes are not silently overwritten.</li>
+      <li>Filenames and paths are sanitized for Windows and registered before any local open/reveal action.</li>
+      <li>LegiView does not execute downloaded content. Treat every PDF or Office file as untrusted.</li>
+    </ul>
+  </section>
+
+  <section class="help-section sources-section" id="sources">
+    <h3>Official Sources and Acceptable Use</h3>
+    <p>Oregon Legislature OData is the preferred structured source. LegiView requests only known OLIS testimony pages where the displayed document list or historical presentation context must be reconciled. It is not a general-purpose crawler.</p>
+    <div class="source-card-grid">
+      <a class="source-card" href="https://www.oregonlegislature.gov/citizen_engagement/Pages/data.aspx" target="_blank" rel="noopener"><strong>Oregon Legislative Data</strong><span>Official API entry point and data model</span></a>
+      <a class="source-card" href="https://api.oregonlegislature.gov/odata/odataservice.svc/" target="_blank" rel="noopener"><strong>OData Service</strong><span>Measure, committee, member, and document metadata</span></a>
+      <a class="source-card" href="https://olis.oregonlegislature.gov/" target="_blank" rel="noopener"><strong>OLIS</strong><span>Official bill pages and testimony displays</span></a>
+      <a class="source-card" href="https://www.oregonlegislature.gov/citizen_engagement/Documents/OLODataAcceptableUseAgreement.pdf" target="_blank" rel="noopener"><strong>Acceptable-Use Agreement</strong><span>Read and accept through the Legislature's normal process</span></a>
+    </div>
+    <div class="notice warning-note"><strong>Operator responsibility</strong><span>You must accept and follow any Oregon Legislature Open Data agreement through its normal process. LegiView does not automate acceptance, bypass access controls, evade rate limits, or conceal its User-Agent.</span></div>
+  </section>
+
+  <section class="help-section" id="settings-help">
+    <h3>Settings Guidance</h3>
+    <dl class="term-list">
+      <div><dt>Archive root</dt><dd>Choose a durable location with enough capacity, normally outside this Git repository.</dd></div>
+      <div><dt>Request timeout</dt><dd>Maximum time for a source request before it becomes a recorded failure.</dd></div>
+      <div><dt>OData workers</dt><dd>Keep low; filtered incremental requests are more important than parallelism.</dd></div>
+      <div><dt>Download workers</dt><dd>Controls bounded file acquisition. The default is intentionally conservative.</dd></div>
+      <div><dt>HTML concurrency</dt><dd>Applies only to known OLIS pages needed for testimony reconciliation.</dd></div>
+      <div><dt>Free-space floor</dt><dd>Prevents a new download from consuming disk capacity reserved for the system.</dd></div>
+      <div><dt>Inter-request delay</dt><dd>Adds pacing between source requests and complements server-directed <code>Retry-After</code>.</dd></div>
+    </dl>
+    <a class="button-link" href="{{ url_for('settings') }}">Open settings</a>
+  </section>
+
+  <section class="help-section compact-help-section" id="limits">
+    <h3>Phase 1 Boundaries</h3>
+    <p>Phase 1 does not perform multi-year backfill orchestration, scheduling, full-text indexing, OCR, semantic analysis, antivirus scanning, cloud hosting, or destructive source mirroring. It establishes the trustworthy collector, schema, downloader, durable run model, CLI, and local Flask interface that later phases can scale.</p>
+  </section>
+{% endblock %}

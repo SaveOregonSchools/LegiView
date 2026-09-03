@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>{% block title %}LegiView{% endblock %}</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='app.css') }}">
+    {% block head_extra %}{% endblock %}
+  </head>
+  <body>
+    <header class="site-header">
+      <div class="brand">
+        <a class="home-mark" href="{{ url_for('home') }}" aria-label="LegiView home">L</a>
+        <div>
+          <h1>LegiView</h1>
+          <p class="subtitle">Oregon legislative data and document archive</p>
+        </div>
+      </div>
+      <div class="header-actions">
+        <nav class="nav-links" aria-label="Main navigation">
+          <a{% if request.endpoint == 'home' %} class="active"{% endif %} href="{{ url_for('home') }}">Home</a>
+          <a{% if request.endpoint == 'help_page' %} class="active"{% endif %} href="{{ url_for('help_page') }}">Help</a>
+          <a{% if request.endpoint == 'settings' %} class="active"{% endif %} href="{{ url_for('settings') }}">Settings</a>
+        </nav>
+        <a class="brand-link" href="https://www.saveoregonschools.com/" target="_blank" rel="noopener" aria-label="Save Oregon Schools website">
+          <img class="brand-logo" src="{{ url_for('static', filename='save-oregon-schools-logo.png') }}" alt="Save Oregon Schools">
+        </a>
+      </div>
+    </header>
+
+    <main id="main-content">
+      {% with messages = get_flashed_messages(with_categories=true) %}
+        {% if messages %}
+          <div class="messages" role="status" aria-live="polite">
+            {% for category, message in messages %}
+              <div class="message {{ category }}">{{ message }}</div>
+            {% endfor %}
+          </div>
+        {% endif %}
+      {% endwith %}
+      {% block content %}{% endblock %}
+    </main>
+
+    <footer class="footer">
+      Copyright &copy; {{ year or current_year or 2026 }} Save Oregon Schools, LLC.
+      <a href="https://www.saveoregonschools.com/" target="_blank" rel="noopener">saveoregonschools.com</a>
+      <span aria-hidden="true">|</span>
+      <a href="{{ url_for('help_page') }}">Data sources and acceptable use</a>
+      <span aria-hidden="true">|</span>
+      <a href="https://github.com/SaveOregonSchools/LegiView" target="_blank" rel="noopener">Source code</a>
+    </footer>
+  </body>
+</html>
