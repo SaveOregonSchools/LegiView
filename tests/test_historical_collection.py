@@ -17,7 +17,10 @@ from olis_archive.runtime import build_runtime
 from olis_archive.services.collection import CollectionService
 from olis_archive.services.downloads import Downloader
 from olis_archive.services.historical_collection import HistoricalRunControl
-from olis_archive.services.historical_sources import REQUIRED_METADATA_PROPERTIES
+from olis_archive.services.historical_sources import (
+    REQUIRED_METADATA_PROPERTIES,
+    HistoricalSourceError,
+)
 from olis_archive.services.odata import ODataPage
 from olis_archive.services.probes import ProbeResult
 
@@ -478,11 +481,12 @@ def test_inventory_run_freezes_official_scope_streams_pages_and_never_downloads(
     run_id = service.create_inventory_backfill_run(["2026r1"])
     frozen = json.loads(service.runs.get_run(run_id)["requested_scope_json"])
     assert frozen["boundary_session_key"] == "2014R1"
+    assert frozen["boundary_begin_date"] == "2014-02-03T00:00:00"
     assert frozen["session_keys"] == ["2026R1"]
     assert frozen["resolved_from"] == "official LegislativeSessions BeginDate chronology"
     assert {
         row["session_key"] for row in service.storage.list_sessions()
-    } == {"2014R1", "2014S1", "2026R1"}
+    } == {"2013R1", "2014R1", "2014S1", "2026R1"}
     odata.sessions.append(_session("2027R1", "2027-01-01T00:00:00"))
 
     assert service.execute_run(run_id) == "completed"
@@ -594,6 +598,168 @@ def test_omitted_selection_freezes_every_official_session_at_or_after_boundary(
         if item["item_type"] == "session"
     ]
     assert [item["session_key"] for item in session_items] == frozen["session_keys"]
+
+
+def test_pre_boundary_cli_style_exact_selection_is_rejected_before_run_creation(
+    tmp_path: Path, fixture_dir: Path
+):
+    service, _odata, _olis, _downloader = _service(tmp_path, fixture_dir)
+
+    with pytest.raises(
+        HistoricalSourceError,
+        match="predate LegiView's validated support boundary 2014R1.*2013R1",
+    ):
+        service.create_inventory_backfill_run(["2013R1"])
+
+    assert service.runs.list_runs() == []
+
+
+def test_direct_measure_and_session_runs_reject_pre_boundary_year_before_creation(
+    tmp_path: Path, fixture_dir: Path
+):
+    service, _odata, _olis, _downloader = _service(tmp_path, fixture_dir)
+
+    with pytest.raises(HistoricalSourceError, match="2007R1.*2014R1"):
+        service.create_collect_bill_run("2007R1", "HB2001")
+    with pytest.raises(HistoricalSourceError, match="2007R1.*2014R1"):
+        service.create_collect_session_run("2007R1")
+
+    assert service.runs.list_runs() == []
+
+    legacy_run = service.runs.create_run(
+        "collect_bill",
+        session_key="2007R1",
+        bill_id_compact="HB2001",
+        scope={"session_key": "2007R1", "bill_id_compact": "HB2001"},
+    )
+    with pytest.raises(HistoricalSourceError, match="2007R1.*2014R1"):
+        service.create_retry_failures_run(legacy_run)
+    with pytest.raises(HistoricalSourceError, match="2007R1.*2014R1"):
+        service.create_retry_matching_run(session_key="2007R1")
+
+    assert [row["id"] for row in service.runs.list_runs()] == [legacy_run]
+
+
+def test_inventory_run_skips_incompatible_catalogue_rows_but_freezes_diagnostics(
+    tmp_path: Path, fixture_dir: Path
+):
+    service, odata, _olis, _downloader = _service(tmp_path, fixture_dir)
+    missing_key = _session("2001R1", "2001-01-01T00:00:00")
+    missing_key.pop("SessionKey")
+    odata.sessions.extend(
+        [
+            _session("1999R1", "1999-01-11T00:00:00"),
+            _session("LEGACY-A", "not-a-date"),
+            missing_key,
+        ]
+    )
+
+    resolved = service.historical_session_scope()
+    run_id = service.create_inventory_backfill_run(
+        resolved_scope=resolved.selected(["2026R1"])
+    )
+    frozen = json.loads(service.runs.get_run(run_id)["requested_scope_json"])
+
+    assert frozen["session_keys"] == ["2026R1"]
+    assert len(frozen["catalogue_guardrails"]) == 3
+    assert {row["session_key"] for row in service.storage.list_sessions()} == {
+        "2013R1",
+        "2014R1",
+        "2014S1",
+        "2026R1",
+    }
+
+
+@pytest.mark.parametrize("run_type", ("inventory_backfill", "download_archive"))
+def test_legacy_frozen_historical_scope_fails_before_source_or_payload_work(
+    tmp_path: Path,
+    fixture_dir: Path,
+    run_type: str,
+):
+    service, odata, _olis, downloader = _service(tmp_path, fixture_dir)
+    run_id = service.runs.create_run(
+        run_type,
+        session_keys=["2007R1"],
+        scope={"session_keys": ["2007R1"]},
+    )
+
+    assert service.execute_run(run_id) == "failed"
+    assert odata.calls == []
+    assert downloader.calls == []
+    assert "2007R1" in service.runs.errors(run_id)[0]["message"]
+
+
+@pytest.mark.parametrize("run_type", ("inventory_backfill", "download_archive"))
+def test_legacy_historical_scope_cannot_be_requeued(
+    tmp_path: Path,
+    fixture_dir: Path,
+    run_type: str,
+):
+    service, _odata, _olis, _downloader = _service(tmp_path, fixture_dir)
+    run_id = service.runs.create_run(
+        run_type,
+        session_keys=["2007R1"],
+        scope={"session_keys": ["2007R1"]},
+    )
+    assert service.runs.claim_run(run_id)
+    service.storage.normalize_interrupted_work()
+    assert service.runs.get_run(run_id)["status"] == "interrupted"
+
+    with pytest.raises(HistoricalSourceError, match="2007R1.*2014R1"):
+        service.requeue_run(run_id)
+
+    assert service.runs.get_run(run_id)["status"] == "interrupted"
+
+
+def test_download_preflight_rejects_or_ignores_legacy_inventory_scope(
+    tmp_path: Path,
+    fixture_dir: Path,
+):
+    service, _odata, _olis, _downloader = _service(tmp_path, fixture_dir)
+    service.storage.upsert_session(
+        {
+            "session_key": "2007R1",
+            "session_name": "2007 Regular Session",
+            "session_year": 2007,
+            "begin_date": "2007-01-08T00:00:00",
+        }
+    )
+    inventory_run = service.runs.create_run(
+        "inventory_backfill", session_keys=["2007R1"]
+    )
+    service.storage.finish_session_inventory(
+        "2007R1", inventory_run, "inventory_complete"
+    )
+
+    with pytest.raises(HistoricalSourceError, match="2007R1.*2014R1"):
+        service.download_archive_preflight(["2007R1"])
+    with pytest.raises(ValueError, match="No inventoried sessions"):
+        service.download_archive_preflight()
+
+
+def test_pre_resolved_range_snapshot_is_frozen_without_second_source_scan(
+    tmp_path: Path, fixture_dir: Path
+):
+    service, odata, _olis, _downloader = _service(tmp_path, fixture_dir)
+    official = service.historical_session_scope()
+    selected = official.selected_range("2014S1", "2026R1")
+    session_scans_before = sum(
+        entity == "LegislativeSessions" for entity, _params in odata.calls
+    )
+
+    run_id = service.create_inventory_backfill_run(resolved_scope=selected)
+
+    session_scans_after = sum(
+        entity == "LegislativeSessions" for entity, _params in odata.calls
+    )
+    assert session_scans_after == session_scans_before == 1
+    frozen = json.loads(service.runs.get_run(run_id)["requested_scope_json"])
+    assert frozen["session_keys"] == ["2014S1", "2026R1"]
+    assert frozen["boundary_session_key"] == "2014R1"
+    assert frozen["boundary_begin_date"] == "2014-02-03T00:00:00"
+    assert {
+        row["session_key"] for row in service.storage.list_sessions()
+    } == {"2013R1", "2014R1", "2014S1", "2026R1"}
 
 
 def test_inventory_run_creation_rolls_back_run_and_catalogue_on_persistence_failure(

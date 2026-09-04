@@ -4,11 +4,13 @@ from contextlib import contextmanager
 import json
 from pathlib import Path
 import shutil
+import sqlite3
 
 import pytest
 
 from olis_archive.database import Database
 from olis_archive.services.runs import RunStore
+from olis_archive.services.source_mapping import normalize_bill_id
 from olis_archive.services.storage import StorageService
 
 
@@ -35,12 +37,13 @@ def _seed_bill(
     run_id: int | None = None,
 ) -> int:
     _seed_session(storage, session_key)
+    prefix, number, normalized, _display = normalize_bill_id(compact)
     return storage.upsert_bill(
         {
             "session_key": session_key,
-            "measure_prefix": compact[:2],
-            "measure_number": compact[2:],
-            "bill_id_compact": compact,
+            "measure_prefix": prefix,
+            "measure_number": number,
+            "bill_id_compact": normalized,
             "bill_title": "Relating to a persistence test.",
         },
         seen_at=T1,
@@ -149,7 +152,7 @@ def test_phase1_database_upgrades_without_data_loss(tmp_path: Path):
         )
 
     upgraded = Database(path)
-    assert upgraded.initialize() == 5
+    assert upgraded.initialize() == 6
     assert upgraded.foreign_key_violations() == []
     with upgraded.connection() as connection:
         assert connection.execute(
@@ -188,26 +191,65 @@ def test_display_reconciliation_migration_preserves_v2_rows_and_adds_family_key(
     path = tmp_path / "phase2.sqlite3"
     phase2 = Database(path, migrations_path=migrations)
     assert phase2.initialize() == 2
-    storage = StorageService(phase2, initialize=False)
-    bill_id = _seed_bill(storage)
-    _seed_document(storage, bill_id, "10")
-    committee_bill_id = _seed_bill(storage, compact="HB4111")
-    storage.upsert_document(
-        {
-            "bill_id": committee_bill_id,
-            "document_kind": "committee_presentation",
-            "source_section": "odata_committee_document",
-            "source_entity_type": "CommitteeMeetingDocument",
-            "source_id": "32769",
-            "raw_document_type": "Presentation",
-            "canonical_download_url": (
-                "https://olis.oregonlegislature.gov/liz/2026R1/Downloads/"
-                "CommitteeMeetingDocument/32769"
-            ),
-        },
-        seen_at=T1,
-    )
     with phase2.transaction() as connection:
+        connection.execute(
+            """
+            INSERT INTO sessions(
+                session_key,session_name,first_seen_at,last_seen_at,last_synced_at
+            ) VALUES ('2026R1','Session 2026R1',?,?,?)
+            """,
+            (T1, T1, T1),
+        )
+        bill_id = int(
+            connection.execute(
+                """
+                INSERT INTO bills(
+                    session_key,measure_prefix,measure_number,bill_id_compact,
+                    bill_id_display,bill_chamber,bill_title,first_collected_at,
+                    last_seen_at,last_synced_at
+                ) VALUES ('2026R1','SB','1501','SB1501','SB 1501','Senate',
+                          'Public testimony measure',?,?,?)
+                """,
+                (T1, T1, T1),
+            ).lastrowid
+        )
+        committee_bill_id = int(
+            connection.execute(
+                """
+                INSERT INTO bills(
+                    session_key,measure_prefix,measure_number,bill_id_compact,
+                    bill_id_display,bill_chamber,bill_title,first_collected_at,
+                    last_seen_at,last_synced_at
+                ) VALUES ('2026R1','HB','4111','HB4111','HB 4111','House',
+                          'Committee document measure',?,?,?)
+                """,
+                (T1, T1, T1),
+            ).lastrowid
+        )
+        connection.execute(
+            """
+            INSERT INTO documents(
+                bill_id,session_key,bill_id_compact,document_kind,source_section,
+                source_entity_type,source_id,first_seen_at,last_seen_at
+            ) VALUES (?,'2026R1','SB1501','public_testimony','odata_public_testimony',
+                      'CommitteePublicTestimony','10',?,?)
+            """,
+            (bill_id, T1, T1),
+        )
+        connection.execute(
+            """
+            INSERT INTO documents(
+                bill_id,session_key,bill_id_compact,document_kind,source_section,
+                source_entity_type,source_id,raw_document_type,canonical_download_url,
+                first_seen_at,last_seen_at
+            ) VALUES (?,'2026R1','HB4111','committee_presentation',
+                      'odata_committee_document','CommitteeMeetingDocument','32769',
+                      'Presentation',
+                      'https://olis.oregonlegislature.gov/liz/2026R1/Downloads/CommitteeMeetingDocument/32769',
+                      ?,?)
+            """,
+            (committee_bill_id, T1, T1),
+        )
         connection.execute(
             """
             INSERT INTO olis_display_reconciliations(
@@ -232,7 +274,7 @@ def test_display_reconciliation_migration_preserves_v2_rows_and_adds_family_key(
         )
 
     upgraded = Database(path)
-    assert upgraded.initialize() == 5
+    assert upgraded.initialize() == 6
     migrated = StorageService(upgraded, initialize=False)
     rows = migrated.list_olis_display_reconciliations(bill_id)
     assert len(rows) == 1
@@ -257,6 +299,346 @@ def test_display_reconciliation_migration_preserves_v2_rows_and_adds_family_key(
         for row in migrated.list_olis_display_reconciliations(bill_id)
     } == {"CommitteePublicTestimony", "CommitteeMeetingDocument"}
     assert upgraded.foreign_key_violations() == []
+
+
+def test_expanded_measure_migration_preserves_data_and_invalidates_old_scope(
+    tmp_path: Path,
+):
+    migrations = tmp_path / "pre_expansion_migrations"
+    migrations.mkdir()
+    source_root = Path(__file__).parents[1] / "olis_archive" / "migrations"
+    for name in (
+        "001_initial.sql",
+        "002_historical_inventory.sql",
+        "003_display_reconciliation_source_family.sql",
+        "004_archive_claim_plans.sql",
+        "005_archive_claim_cursors.sql",
+    ):
+        shutil.copyfile(source_root / name, migrations / name)
+
+    path = tmp_path / "expanded.sqlite3"
+    before = Database(path, migrations_path=migrations)
+    assert before.initialize() == 5
+    with before.transaction() as connection:
+        connection.execute(
+            """
+            INSERT INTO collection_runs(
+                id,run_uuid,run_type,requested_scope_json,status,stage,queued_at,
+                started_at,finished_at,updated_at,sessions_total,sessions_completed,
+                bills_total,documents_discovered,summary_json
+            ) VALUES (7,'terminal-inventory','inventory_backfill','{}','completed',
+                      'finalize_run',?,?,?,?,1,1,1,1,'{"historical":true}')
+            """,
+            (T1, T1, T2, T2),
+        )
+        connection.execute(
+            """
+            INSERT INTO collection_runs(
+                id,run_uuid,run_type,requested_scope_json,status,stage,queued_at,
+                started_at,updated_at,sessions_total,sessions_completed,
+                sessions_incomplete,sessions_failed,bills_total,
+                bills_completed,documents_discovered,summary_json
+            ) VALUES (8,'paused-inventory','inventory_backfill','{}','paused',
+                      'sync_measures',?,?,?,1,1,1,1,99,77,88,'{"partial":true}')
+            """,
+            (T1, T1, T2),
+        )
+        connection.execute(
+            """
+            INSERT INTO sessions(
+                session_key,session_name,first_seen_at,last_seen_at,last_synced_at
+            ) VALUES ('2026R1','2026 Regular Session',?,?,?)
+            """,
+            (T1, T1, T1),
+        )
+        connection.execute(
+            """
+            INSERT INTO bills(
+                id,session_key,measure_id,measure_prefix,measure_number,
+                bill_id_compact,bill_id_display,bill_chamber,bill_title,
+                first_collected_at,last_seen_at,last_synced_at,
+                last_collected_run_id,raw_json,source_presence,
+                last_source_reconciled_at
+            ) VALUES (41,'2026R1','9001','HB','4001','HB4001','HB 4001',
+                      'House','Preserved measure',?,?,?,7,'{"preserved":true}',
+                      'active',?)
+            """,
+            (T1, T2, T2, T2),
+        )
+        connection.execute(
+            """
+            INSERT INTO documents(
+                id,bill_id,session_key,bill_id_compact,document_kind,
+                source_section,source_entity_type,source_id,title,
+                first_seen_at,last_seen_at,last_seen_run_id
+            ) VALUES (51,41,'2026R1','HB4001','public_testimony',
+                      'odata_public_testimony','CommitteePublicTestimony','123',
+                      'Preserved testimony',?,?,7)
+            """,
+            (T1, T2),
+        )
+        connection.execute(
+            """
+            INSERT INTO olis_display_reconciliations(
+                bill_id,source_entity_type,session_key,status,checked_at,run_id,
+                odata_record_count,displayed_record_count,page_only_count,
+                odata_only_count,details_json
+            ) VALUES (41,'CommitteePublicTestimony','2026R1',
+                      'checked_with_records',?,7,1,1,0,0,'{}')
+            """,
+            (T2,),
+        )
+        for entity_set in (
+            "Measures",
+            "CommitteePublicTestimonies",
+            "Legislators",
+        ):
+            connection.execute(
+                """
+                INSERT INTO source_sync_state(
+                    session_key,entity_set,sync_strategy,last_attempted_at,
+                    last_successful_sync_at,last_full_session_sync_at,
+                    last_incremental_sync_at,source_watermark,
+                    last_successful_run_id,last_returned_source_count,
+                    last_reconciliation_outcome,is_incomplete,last_failure_at,
+                    last_error_class,last_error_message,details_json,updated_at
+                ) VALUES ('2026R1',?,'watermark',?,?,?,?,?,7,10,
+                          'incremental_overlap',0,?,'TimeoutError','preserved',
+                          '{"preserved":true}',?)
+                """,
+                (entity_set, T2, T2, T2, T2, T2, T2, T2),
+            )
+        connection.execute(
+            """
+            INSERT INTO session_archive_state(
+                session_key,inventory_status,last_inventory_started_at,
+                last_inventory_completed_at,last_inventory_run_id,
+                last_successful_inventory_run_id,last_download_started_at,
+                last_download_completed_at,last_download_run_id,
+                display_reconciliation_status,last_testimony_reconciled_at,
+                source_anomaly_count,material_anomaly_count,
+                completeness_details_json,updated_at
+            ) VALUES ('2026R1','inventory_complete',?,?,7,7,?,?,7,
+                      'complete',?,7,2,'{"complete":true}',?)
+            """,
+            (T1, T2, T2, T3, T2, T2),
+        )
+        for run_id in (7, 8):
+            connection.execute(
+                """
+                INSERT INTO collection_run_items(
+                    run_id,item_type,item_key,session_key,stage,status,
+                    current_activity,progress_current,progress_total,queued_at,
+                    started_at,finished_at,updated_at
+                ) VALUES (?,'session','2026R1','2026R1','finalize_session',
+                          'completed','Complete under old scope',1,1,?,?,?,?)
+                """,
+                (run_id, T1, T1, T2, T2),
+            )
+
+    upgraded = Database(path)
+    assert upgraded.initialize() == 6
+    assert upgraded.foreign_key_violations() == []
+    with upgraded.connection() as connection:
+        bill = connection.execute(
+            "SELECT * FROM bills WHERE id=41"
+        ).fetchone()
+        assert bill is not None
+        assert bill["measure_prefix"] == "HB"
+        assert bill["measure_type"] == "bill"
+        assert bill["bill_title"] == "Preserved measure"
+        assert bill["last_collected_run_id"] == 7
+        assert json.loads(bill["raw_json"]) == {"preserved": True}
+        assert connection.execute(
+            "SELECT bill_id FROM documents WHERE id=51"
+        ).fetchone()[0] == 41
+        assert connection.execute(
+            "SELECT bill_id FROM olis_display_reconciliations WHERE bill_id=41"
+        ).fetchone()[0] == 41
+
+        measure_type_column = next(
+            row for row in connection.execute("PRAGMA table_info(bills)")
+            if row["name"] == "measure_type"
+        )
+        assert measure_type_column["notnull"] == 1
+        indexes = {
+            row["name"] for row in connection.execute("PRAGMA index_list(bills)")
+        }
+        assert {
+            "idx_bills_session_measure_id",
+            "idx_bills_session_chamber_number",
+            "idx_bills_title",
+            "idx_bills_last_synced",
+            "idx_bills_id_session",
+            "idx_bills_presence_page",
+            "idx_bills_session_compact",
+        } <= indexes
+
+        sync_rows = connection.execute(
+            "SELECT * FROM source_sync_state ORDER BY entity_set"
+        ).fetchall()
+        assert len(sync_rows) == 3
+        sync_by_entity = {row["entity_set"]: row for row in sync_rows}
+        for entity_set in ("Measures", "CommitteePublicTestimonies"):
+            row = sync_by_entity[entity_set]
+            assert row["last_attempted_at"] == T2
+            assert row["last_successful_sync_at"] is None
+            assert row["last_full_session_sync_at"] is None
+            assert row["last_incremental_sync_at"] is None
+            assert row["source_watermark"] is None
+            assert row["last_successful_run_id"] is None
+            assert row["last_returned_source_count"] is None
+            assert row["last_reconciliation_outcome"] == (
+                "invalidated_expanded_measure_scope"
+            )
+            assert row["is_incomplete"] == 1
+            assert row["last_error_class"] == "TimeoutError"
+            assert json.loads(row["details_json"]) == {"preserved": True}
+        reference_sync = sync_by_entity["Legislators"]
+        assert reference_sync["last_successful_sync_at"] == T2
+        assert reference_sync["last_full_session_sync_at"] == T2
+        assert reference_sync["last_incremental_sync_at"] == T2
+        assert reference_sync["source_watermark"] == T2
+        assert reference_sync["last_successful_run_id"] == 7
+        assert reference_sync["last_returned_source_count"] == 10
+        assert reference_sync["last_reconciliation_outcome"] == "incremental_overlap"
+        assert reference_sync["is_incomplete"] == 0
+
+        session_state = connection.execute(
+            "SELECT * FROM session_archive_state WHERE session_key='2026R1'"
+        ).fetchone()
+        assert session_state["inventory_status"] == "not_started"
+        assert session_state["last_inventory_started_at"] is None
+        assert session_state["last_inventory_completed_at"] is None
+        assert session_state["last_inventory_run_id"] is None
+        assert session_state["last_successful_inventory_run_id"] is None
+        assert session_state["display_reconciliation_status"] is None
+        assert session_state["last_testimony_reconciled_at"] is None
+        assert session_state["last_download_started_at"] == T2
+        assert session_state["last_download_completed_at"] == T3
+        assert session_state["last_download_run_id"] == 7
+        assert session_state["source_anomaly_count"] == 7
+        assert session_state["material_anomaly_count"] == 2
+        assert json.loads(session_state["completeness_details_json"]) == {
+            "invalidated_by_migration": 6,
+            "reason": "expanded_measure_scope",
+        }
+
+        terminal_item = connection.execute(
+            "SELECT status FROM collection_run_items WHERE run_id=7"
+        ).fetchone()
+        paused_item = connection.execute(
+            """
+            SELECT status,progress_current,progress_total,started_at,finished_at,
+                   details_json
+            FROM collection_run_items WHERE run_id=8
+            """
+        ).fetchone()
+        assert terminal_item["status"] == "completed"
+        assert paused_item["status"] == "interrupted"
+        assert paused_item["progress_current"] == 0
+        assert paused_item["progress_total"] is None
+        assert paused_item["started_at"] is None
+        assert paused_item["finished_at"] is None
+        assert paused_item["details_json"] == "{}"
+        terminal_run = connection.execute(
+            "SELECT sessions_completed,bills_total,summary_json FROM collection_runs WHERE id=7"
+        ).fetchone()
+        paused_run = connection.execute(
+            """
+            SELECT sessions_completed,sessions_incomplete,sessions_failed,
+                   bills_total,bills_completed,documents_discovered,summary_json
+            FROM collection_runs WHERE id=8
+            """
+        ).fetchone()
+        assert tuple(terminal_run) == (1, 1, '{"historical":true}')
+        assert tuple(paused_run) == (0, 0, 0, 0, 0, 0, "{}")
+
+        prefix_types = {
+            "HB": ("bill", "House"),
+            "SB": ("bill", "Senate"),
+            "HJR": ("joint_resolution", "House"),
+            "SJR": ("joint_resolution", "Senate"),
+            "HCR": ("concurrent_resolution", "House"),
+            "SCR": ("concurrent_resolution", "Senate"),
+            "HR": ("resolution", "House"),
+            "SR": ("resolution", "Senate"),
+            "HJM": ("joint_memorial", "House"),
+            "SJM": ("joint_memorial", "Senate"),
+            "HM": ("memorial", "House"),
+            "SM": ("memorial", "Senate"),
+        }
+        inserted_ids = []
+        for number, (prefix, (measure_type, chamber)) in enumerate(
+            prefix_types.items(), start=101
+        ):
+            inserted_ids.append(
+                int(
+                    connection.execute(
+                        """
+                        INSERT INTO bills(
+                            session_key,measure_prefix,measure_type,measure_number,
+                            bill_id_compact,bill_id_display,bill_chamber,
+                            first_collected_at,last_seen_at,last_synced_at
+                        ) VALUES ('2026R1',?,?,?,?,?,?,?, ?, ?)
+                        """,
+                        (
+                            prefix,
+                            measure_type,
+                            str(number),
+                            f"{prefix}{number}",
+                            f"{prefix} {number}",
+                            chamber,
+                            T1,
+                            T1,
+                            T1,
+                        ),
+                    ).lastrowid
+                )
+            )
+        assert min(inserted_ids) > 41
+        assert {
+            (row["measure_prefix"], row["measure_type"])
+            for row in connection.execute(
+                "SELECT measure_prefix,measure_type FROM bills WHERE id<>41"
+            )
+        } == {(prefix, values[0]) for prefix, values in prefix_types.items()}
+
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                """
+                INSERT INTO bills(
+                    session_key,measure_prefix,measure_type,measure_number,
+                    bill_id_compact,bill_id_display,bill_chamber,
+                    first_collected_at,last_seen_at,last_synced_at
+                ) VALUES ('2026R1','XYZ','bill','1','XYZ1','XYZ 1','House',?,?,?)
+                """,
+                (T1, T1, T1),
+            )
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                """
+                INSERT INTO bills(
+                    session_key,measure_prefix,measure_type,measure_number,
+                    bill_id_compact,bill_id_display,bill_chamber,
+                    first_collected_at,last_seen_at,last_synced_at
+                ) VALUES ('2026R1','HJR','bill','999','HJR999','HJR 999',
+                          'House',?,?,?)
+                """,
+                (T1, T1, T1),
+            )
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                """
+                INSERT INTO bills(
+                    session_key,measure_prefix,measure_type,measure_number,
+                    bill_id_compact,bill_id_display,bill_chamber,
+                    first_collected_at,last_seen_at,last_synced_at
+                ) VALUES ('2026R1','HJR','joint_resolution','998','HJR998',
+                          'HJR 998','Senate',?,?,?)
+                """,
+                (T1, T1, T1),
+            )
 
 
 def test_historical_run_scope_is_frozen_with_session_items_and_cutoff(tmp_path: Path):

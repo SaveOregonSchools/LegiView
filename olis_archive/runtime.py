@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import logging
 import os
 from pathlib import Path
@@ -117,17 +117,35 @@ def _bootstrap_config(
     if overrides:
         if overrides.get("project_root") is not None:
             base = base.with_project_root(overrides["project_root"])
+        direct_values = {
+            key: overrides[key]
+            for key in (
+                "host",
+                "port",
+                "debug",
+                "odata_base_url",
+                "olis_base_url",
+                "user_agent",
+            )
+            if overrides.get(key) is not None
+        }
+        if direct_values:
+            base = replace(base, **direct_values)
         runtime_values = {
             key: value
             for key, value in overrides.items()
             if key in base.snapshot()
-            and key not in {"database_path", "project_root", "archive_root_configured"}
+            and key
+            not in {
+                "database_path",
+                "project_root",
+                "archive_root_configured",
+                *direct_values,
+            }
         }
         if runtime_values:
             base = base.with_settings(runtime_values)
         if overrides.get("database_path") is not None:
-            from dataclasses import replace
-
             base = replace(
                 base,
                 database_path=Path(overrides["database_path"]),

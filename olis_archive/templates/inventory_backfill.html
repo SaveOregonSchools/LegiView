@@ -7,7 +7,7 @@
     <div>
       <p class="eyebrow">Historical collection</p>
       <h2>Inventory Backfill</h2>
-      <p class="heading-summary">Catalog official sessions, HB/SB metadata, and document identities without downloading payloads.</p>
+      <p class="heading-summary">Catalog official sessions, supported legislative-measure metadata, and document identities without downloading payloads.</p>
     </div>
     <div class="action-row">
       <form class="inline-form" method="post" action="{{ url_for('inventory_backfill') }}">
@@ -42,27 +42,49 @@
     </div>
     <div class="detail-card">
       <h3>What this run does</h3>
-      <p>It resolves official sessions at or after <code>2014R1</code>, syncs HB/SB source entities page by page, reconciles required OLIS displays, normalizes durable document records, and records explicit completeness. It does <strong>not</strong> start Download Archive.</p>
+      <p>It scans the complete official session catalogue, then collects supported legislative measures only for sessions at or after the verified <code>2014R1</code> boundary. It syncs source entities page by page, reconciles required OLIS displays, normalizes durable document records, and records explicit completeness. It does <strong>not</strong> start Download Archive.</p>
     </div>
   </section>
 
   <section class="content-section">
-    <div class="section-heading-row"><h2>Historical session scope</h2><span class="status-note">All resolved sessions are selected by default.</span></div>
+    <div class="section-heading-row"><h2>Historical session scope</h2><span class="status-note">The default range is 2014R1 through the newest official session.</span></div>
     <form method="post" action="{{ url_for('inventory_backfill') }}">
       <input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
       {% if sessions %}
+        <div class="option-panel">
+          <div class="collection-form">
+            <div>
+              <label for="from_session">From session (oldest endpoint)</label>
+              <select id="from_session" name="from_session">
+                {% for row in sessions %}{% if row.supported %}<option value="{{ row.session_key }}" {% if row.session_key == from_session %}selected{% endif %}>{{ row.session_key }} — {{ row.session_name or 'Official legislative session' }}</option>{% endif %}{% endfor %}
+              </select>
+            </div>
+            <div>
+              <label for="to_session">To session (newest endpoint)</label>
+              <select id="to_session" name="to_session">
+                {% for row in sessions %}{% if row.supported %}<option value="{{ row.session_key }}" {% if row.session_key == to_session %}selected{% endif %}>{{ row.session_key }} — {{ row.session_name or 'Official legislative session' }}</option>{% endif %}{% endfor %}
+              </select>
+            </div>
+          </div>
+          <div class="choice-list">
+            <label class="choice-row"><input type="radio" name="scope_mode" value="range" {% if scope_mode != 'exact' %}checked{% endif %}><span><strong>Inclusive From/To range</strong><small>Includes every official regular, special, short, or interim session between the two endpoints by official BeginDate chronology.</small></span></label>
+            <label class="choice-row"><input type="radio" name="scope_mode" value="exact" {% if scope_mode == 'exact' %}checked{% endif %}><span><strong>Advanced exact selection</strong><small>Uses only the checked supported sessions in the catalogue below. The CLI also supports repeated <code>--session</code> options.</small></span></label>
+          </div>
+        </div>
+        <p class="field-note">Both dropdowns are sorted newest to oldest. “From” is still the older endpoint; LegiView rejects a reversed range instead of guessing your intent.</p>
         <div class="table-scroll"><table>
-          <thead><tr><th class="check-column"><span class="visually-hidden">Select</span></th><th>Session</th><th>Dates</th><th>Inventory state</th><th>Last completed</th></tr></thead>
+          <thead><tr><th class="check-column"><span class="visually-hidden">Exact selection</span></th><th>Session</th><th>Support</th><th>Dates</th><th>Inventory state</th><th>Last completed</th></tr></thead>
           <tbody>{% for row in sessions %}<tr>
-            <td><input type="checkbox" name="session_keys" value="{{ row.session_key }}" aria-label="Select {{ row.session_key }}" {% if row.session_key in selected_sessions %}checked{% endif %}></td>
+            <td><input type="checkbox" {% if row.supported %}name="session_keys" value="{{ row.session_key }}" {% if row.session_key in selected_sessions %}checked{% endif %}{% else %}disabled{% endif %} aria-label="{% if row.supported %}Select{% else %}Unavailable{% endif %} {{ row.session_key }} for exact scope"></td>
             <td><strong>{{ row.session_key }}</strong><div class="table-note">{{ row.session_name or 'Official legislative session' }}</div></td>
+            <td>{% if row.supported %}<span class="status completed">Supported</span>{% else %}<span class="status not_applicable">Unavailable</span><div class="table-note">{{ row.support_reason }}</div>{% endif %}</td>
             <td>{{ row.begin_date or '—' }}<div class="table-note">through {{ row.end_date or 'open / unknown' }}</div></td>
             <td><span class="status {{ row.inventory_status or 'not_started' }}">{{ (row.inventory_status or 'not_started')|replace('_', ' ') }}</span></td>
             <td>{{ row.last_inventory_completed_at or '—' }}</td>
           </tr>{% endfor %}</tbody>
         </table></div>
       {% else %}
-        <div class="empty-state"><strong>No historical session catalogue is stored yet.</strong><p>Use “Resolve official sessions” to preview the exact scope. You may also start now; LegiView will resolve and durably snapshot every official session at or after 2014R1 before work begins.</p></div>
+        <div class="empty-state"><strong>No official session catalogue is stored yet.</strong><p>Use “Resolve official sessions” to preview every available session and the 2014R1 support boundary. You may also start now; LegiView will resolve one authoritative catalogue snapshot, default to 2014R1 through the newest supported session, and freeze the expanded keys before work begins.</p></div>
       {% endif %}
       <div class="option-panel">
         <div class="checkbox-field no-top-pad"><input id="probe_remote_sizes" name="probe_remote_sizes" type="checkbox" value="1"><label for="probe_remote_sizes">Probe remote sizes with bounded HEAD / Range requests</label></div>

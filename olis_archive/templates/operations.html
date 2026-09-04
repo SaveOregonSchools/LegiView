@@ -25,7 +25,7 @@
       <input type="hidden" name="view" value="{{ filters.view }}">
       <div><label for="run">Run</label><input id="run" name="run" type="number" min="1" value="{{ filters.run_id or '' }}"></div>
       <div><label for="session">Session</label><input id="session" name="session" value="{{ filters.session or '' }}" placeholder="2026R1"></div>
-      <div><label for="bill">Bill</label><input id="bill" name="bill" value="{{ filters.bill or '' }}" placeholder="SB1501"></div>
+      <div><label for="bill">Measure</label><input id="bill" name="bill" value="{{ filters.bill or '' }}" placeholder="SB1501 or HJR11"></div>
       <div><label for="stage">Stage / source entity</label><input id="stage" name="stage" value="{{ filters.stage or '' }}" placeholder="sync_public_testimony"></div>
       <div><label for="kind">Document kind</label><select id="kind" name="kind"><option value="">All kinds</option>{% for kind in document_kinds %}<option value="{{ kind }}" {% if filters.kind == kind %}selected{% endif %}>{{ kind|replace('_', ' ')|title }}</option>{% endfor %}</select></div>
       {% if filters.view == 'errors' %}
@@ -45,7 +45,7 @@
     {% if rows %}
       <div class="table-scroll"><table>
         {% if filters.view == 'errors' %}
-          <thead><tr><th>Run</th><th>Session / bill</th><th>Stage / source</th><th>Document kind</th><th>Class / HTTP</th><th>Retryable</th><th>Message</th><th>Attempts</th><th>Last seen</th><th>State</th></tr></thead>
+          <thead><tr><th>Run</th><th>Session / measure</th><th>Stage / source</th><th>Document kind</th><th>Class / HTTP</th><th>Retryable</th><th>Message</th><th>Attempts</th><th>Last seen</th><th>State</th></tr></thead>
           <tbody>{% for row in rows %}<tr>
             <td><a href="{{ url_for('run_detail', run_id=row.run_id) }}">#{{ row.run_id }}</a></td>
             <td>{{ row.session_key or '—' }}{% if row.bill_id_compact %}<div><a href="{{ url_for('bills', session=row.session_key, q=row.bill_id_compact) }}">{{ row.bill_id_compact }}</a></div>{% endif %}</td>
@@ -57,7 +57,7 @@
             <td>{{ row.attempt_count }}</td><td>{{ row.last_occurred_at }}</td><td>{{ 'Resolved' if row.resolved_at else 'Open' }}</td>
           </tr>{% endfor %}</tbody>
         {% else %}
-          <thead><tr><th>Run</th><th>Session / bill</th><th>Type</th><th>Severity</th><th>Completeness</th><th>Source identity</th><th>Document kind</th><th>Message</th><th>Occurrences</th><th>Last seen</th><th>State</th></tr></thead>
+          <thead><tr><th>Run</th><th>Session / measure</th><th>Type</th><th>Severity</th><th>Completeness</th><th>Source identity</th><th>Document kind</th><th>Message</th><th>Occurrences</th><th>Last seen</th><th>State</th></tr></thead>
           <tbody>{% for row in rows %}<tr>
             <td>{% if row.last_run_id %}<a href="{{ url_for('run_detail', run_id=row.last_run_id) }}">#{{ row.last_run_id }}</a>{% else %}—{% endif %}</td>
             <td>{{ row.session_key or '—' }}{% if row.bill_id_compact %}<div><a href="{{ url_for('bills', session=row.session_key, q=row.bill_id_compact) }}">{{ row.bill_id_compact }}</a></div>{% endif %}</td>

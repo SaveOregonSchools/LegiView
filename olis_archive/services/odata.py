@@ -18,6 +18,7 @@ from urllib.parse import unquote, urlencode, urljoin, urlsplit
 from urllib.request import Request
 
 from ..config import DEFAULT_USER_AGENT, ODATA_BASE_URL
+from .source_mapping import measure_scope_filter, normalize_measure_prefix
 
 
 LOGGER = logging.getLogger(__name__)
@@ -115,6 +116,7 @@ def odata_datetime_literal(value: str) -> str:
 
 
 def measure_filter(session_key: str, prefix: str, number: int) -> str:
+    prefix = normalize_measure_prefix(prefix)
     return (
         f"SessionKey eq {odata_literal(session_key)} and "
         f"MeasurePrefix eq {odata_literal(prefix)} and MeasureNumber eq {int(number)}"
@@ -577,7 +579,7 @@ class ODataClient:
         params: dict[str, Any] = {
             "filter": (
                 f"SessionKey eq {odata_literal(session_key)} and "
-                "(MeasurePrefix eq 'HB' or MeasurePrefix eq 'SB')"
+                f"{measure_scope_filter()}"
             ),
             "orderby": "MeasurePrefix,MeasureNumber",
         }

@@ -5,6 +5,24 @@ session is assessed from durable per-source sync results, OLIS display checks, a
 unresolved anomalies. Downloading files is deliberately not a condition of inventory
 completeness.
 
+## Catalogue discovery and the support boundary
+
+Session discovery pages the complete official `LegislativeSessions` catalogue. It
+does not silently remove older official rows. LegiView locates the official
+`2014R1` record and uses that record's `BeginDate` as the validated support boundary;
+session ordering and eligibility come from official dates, not lexical session keys,
+suffixes, or `DefaultSession`.
+
+Schema-compatible official sessions before that boundary are persisted for source
+provenance and shown as unavailable in Inventory Backfill, but they are disabled and
+rejected by server-side UI/CLI validation. A malformed or unrecognized catalogue row
+is retained in the resolved view and frozen guardrail diagnostics but is not written
+into schema-constrained session tables. Neither kind receives inventory work items
+or joins the supported-session completeness denominator. Consequently, seeing an
+older catalogue row with no inventory run is not an incomplete inventory condition.
+For a selected supported range, the exact inclusive official-chronology expansion is
+frozen in the durable run; only those keys contribute to that run's completeness.
+
 ## Session inventory states
 
 | State | Meaning |
@@ -20,7 +38,7 @@ completeness.
 A session can be `inventory_complete` only after:
 
 - its official `LegislativeSessions` row was resolved;
-- complete HB/SB measure retrieval succeeded;
+- complete supported legislative-measure retrieval succeeded;
 - required legislators, committees, sponsors, meetings, agenda items, committee
   documents, and public testimony retrieval succeeded;
 - complete floor-letter retrieval succeeded;
@@ -54,7 +72,7 @@ declared missing. An incremental-only response cannot establish disappearance.
 
 ## Source presence is archival, not destructive
 
-Bills and documents retain one of these states:
+Measures and documents retain one of these states:
 
 - `active`: present in the latest successful authoritative comparison;
 - `missing`: absent from a successful complete relevant session/entity comparison;

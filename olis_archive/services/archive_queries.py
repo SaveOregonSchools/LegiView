@@ -242,12 +242,29 @@ class ArchiveQueries:
             offset=offset,
         )
 
-    def session_choices(self, *, inventoried_only: bool = False) -> list[dict[str, Any]]:
+    def session_choices(
+        self,
+        *,
+        inventoried_only: bool = False,
+        include_unsupported: bool = False,
+    ) -> list[dict[str, Any]]:
         condition = "AND a.inventory_status!='not_started'" if inventoried_only else ""
+        support_condition = (
+            ""
+            if include_unsupported
+            else "AND julianday(s.begin_date)>=julianday(boundary.begin_date)"
+        )
         return self._all(
             f"""
             SELECT s.session_key, s.session_name, s.session_type, s.session_year,
                    s.begin_date, s.end_date,
+                   CASE WHEN julianday(s.begin_date)>=julianday(boundary.begin_date)
+                        THEN 1 ELSE 0 END
+                       AS supported,
+                   CASE WHEN julianday(s.begin_date)<julianday(boundary.begin_date)
+                        THEN 'Predates the validated ' || boundary.session_key ||
+                             ' support boundary'
+                        ELSE NULL END AS support_reason,
                    COALESCE(a.inventory_status, 'not_started') AS inventory_status,
                    (SELECT r.finished_at FROM collection_runs r
                     WHERE r.id=a.last_successful_inventory_run_id)
@@ -257,10 +274,10 @@ class ArchiveQueries:
             FROM sessions s
             LEFT JOIN session_archive_state a ON a.session_key=s.session_key
             LEFT JOIN sessions boundary ON boundary.session_key=?
-            WHERE boundary.begin_date IS NOT NULL
-              AND s.begin_date>=boundary.begin_date
+            WHERE julianday(boundary.begin_date) IS NOT NULL
+              {support_condition}
               {condition}
-            ORDER BY COALESCE(s.begin_date, '') DESC, s.session_key DESC
+            ORDER BY julianday(s.begin_date) DESC, s.session_key DESC
             """,
             (HISTORICAL_BOUNDARY_KEY,),
         )
@@ -327,6 +344,12 @@ class ArchiveQueries:
                     WHERE b.session_key=s.session_key AND b.measure_prefix='HB') AS hb_count,
                    (SELECT COUNT(*) FROM bills b
                     WHERE b.session_key=s.session_key AND b.measure_prefix='SB') AS sb_count,
+                   (SELECT COUNT(*) FROM bills b
+                    WHERE b.session_key=s.session_key AND b.bill_chamber='House')
+                       AS house_measure_count,
+                   (SELECT COUNT(*) FROM bills b
+                    WHERE b.session_key=s.session_key AND b.bill_chamber='Senate')
+                       AS senate_measure_count,
                    (SELECT COUNT(*) FROM documents d
                     WHERE d.session_key=s.session_key
                       AND d.document_kind='public_testimony') AS public_testimony_count,
@@ -590,6 +613,10 @@ class ArchiveQueries:
                        AND b.measure_prefix='HB') AS hb_count,
                    (SELECT COUNT(*) FROM bills b WHERE b.session_key=s.session_key
                        AND b.measure_prefix='SB') AS sb_count,
+                   (SELECT COUNT(*) FROM bills b WHERE b.session_key=s.session_key
+                       AND b.bill_chamber='House') AS house_measure_count,
+                   (SELECT COUNT(*) FROM bills b WHERE b.session_key=s.session_key
+                       AND b.bill_chamber='Senate') AS senate_measure_count,
                    (SELECT COUNT(*) FROM documents d WHERE d.session_key=s.session_key)
                        AS documents,
                    (SELECT COUNT(*) FROM documents d WHERE d.session_key=s.session_key
@@ -772,6 +799,7 @@ class ArchiveQueries:
         kind_placeholders = ",".join("?" for _ in RETRY_PAYLOAD_DOCUMENT_KINDS)
         joins = ""
         where = [
+            "CAST(substr(d.session_key,1,4) AS INTEGER) >= 2014",
             f"d.download_status IN ({placeholders})",
             f"d.document_kind IN ({kind_placeholders})",
             "NULLIF(trim(d.canonical_download_url),'') IS NOT NULL",

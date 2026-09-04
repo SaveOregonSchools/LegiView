@@ -27,9 +27,11 @@ class FakeOData:
         measure: dict[str, Any],
         *,
         measures: list[dict[str, Any]] | None = None,
+        child_measure: tuple[str, int] = ("SB", 1501),
     ) -> None:
         self.measure = dict(measure)
         self.measures = [dict(row) for row in (measures or [measure])]
+        self.child_measure = child_measure
         self.calls: list[tuple[str, str]] = []
         self.session_calls = 0
         self.measure_limits: list[int | None] = []
@@ -120,7 +122,7 @@ class FakeOData:
     ) -> list[dict[str, Any]]:
         assert session_key == "2026R1"
         self.calls.append(("for_measure", entity_set))
-        if (prefix, number) != ("SB", 1501):
+        if (prefix, number) != self.child_measure:
             return []
         if entity_set == "MeasureSponsors":
             return [
@@ -218,8 +220,9 @@ class FakeOData:
 
 
 class FakeOLISHTTP:
-    def __init__(self, html: str) -> None:
+    def __init__(self, html: str, *, measure_id: str = "SB1501") -> None:
         self.html = html
+        self.measure_id = measure_id
         self.calls = 0
 
     def testimony_url(self, session_key: str, bill_id: str) -> str:
@@ -227,7 +230,11 @@ class FakeOLISHTTP:
 
     def get_testimony_page(self, session_key: str, bill_id: str) -> HTMLResponse:
         self.calls += 1
-        html = self.html if bill_id == "SB1501" else "<html><body><p>No items to display</p></body></html>"
+        html = (
+            self.html
+            if bill_id == self.measure_id
+            else "<html><body><p>No items to display</p></body></html>"
+        )
         return HTMLResponse(self.testimony_url(session_key, bill_id), html, 200, {})
 
 
@@ -436,6 +443,76 @@ def test_collect_bill_is_durable_idempotent_and_retries_only_failed_payloads(
         for table in stable_counts
     } == stable_counts
     assert service.storage.get_bill("2026R1", "SB1501")["first_collected_at"] == first_collected_at
+
+
+def test_collect_hjr_executes_full_pipeline_and_completes_durably(
+    tmp_path: Path,
+    fixture_dir: Path,
+):
+    measure = json.loads(
+        (fixture_dir / "measure_2026_sb1501.json").read_text(encoding="utf-8")
+    )
+    measure.update(
+        MeasurePrefix="HJR",
+        MeasureNumber=11,
+        PrefixMeaning="House Joint Resolution",
+        CatchLine="Proposes an amendment to the Oregon Constitution.",
+        RelatingTo="Proposing an amendment to the Oregon Constitution.",
+    )
+    html = (fixture_dir / "modern_testimony_2026_sb1501.html").read_text(
+        encoding="utf-8"
+    )
+    service = CollectionService(
+        AppConfig(
+            database_path=tmp_path / "legiview.sqlite3",
+            archive_root=tmp_path / "archive",
+            download_worker_count=2,
+            inter_request_delay=0,
+        ),
+        odata=FakeOData(measure, child_measure=("HJR", 11)),
+        olis_http=FakeOLISHTTP(html, measure_id="HJR11"),
+        downloader=FakeDownloader(),
+        sleep=lambda _seconds: None,
+    )
+
+    run_id = service.create_collect_bill_run("2026R1", "HJR11")
+    assert service.execute_run(run_id) == "completed"
+
+    run = service.runs.get_run(run_id)
+    assert run is not None
+    assert run["bills_completed"] == 1
+    assert run["documents_discovered"] == 5
+    assert run["documents_downloaded"] == 5
+    assert run["documents_failed"] == 0
+
+    stored = service.storage.get_bill("2026R1", "HJR11")
+    assert stored is not None
+    assert stored["measure_type"] == "joint_resolution"
+    assert stored["bill_chamber"] == "House"
+    assert len(service.storage.list_bill_sponsors(stored["id"])) == 2
+    documents = service.storage.list_bill_documents(stored["id"])
+    assert len(documents) == 5
+    assert all(row["download_status"] == "downloaded" for row in documents)
+    by_identity = {
+        (row["source_entity_type"], row["source_id"]): row for row in documents
+    }
+    assert by_identity[("CommitteePublicTestimony", "244133")]["submitter"] == (
+        "Sample Person"
+    )
+    assert by_identity[("CommitteePublicTestimony", "244133")][
+        "source_section"
+    ] == "submitted_written_testimony"
+    assert json.loads(
+        by_identity[("CommitteePublicTestimony", "248220")]["raw_json"]
+    )["parsed_from"] == "OLIS testimony HTML"
+
+    completed_items = service.runs.run_items(run_id)
+    document_items = [
+        item for item in completed_items if item["item_type"] == "document"
+    ]
+    assert len(document_items) == 5
+    assert all(item["status"] == "completed" for item in document_items)
+    assert service.runs.errors(run_id) == []
 
 
 def test_low_space_pauses_run_and_same_run_can_resume_cleanly(tmp_path: Path, fixture_dir: Path):

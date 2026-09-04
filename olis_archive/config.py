@@ -137,10 +137,20 @@ class AppConfig:
     olis_base_url: str = OLIS_BASE_URL
     user_agent: str = DEFAULT_USER_AGENT
     host: str = "127.0.0.1"
-    port: int = 5000
+    # Dedicated loopback port used by both direct development and the supplied
+    # one-worker Gunicorn deployment. It remains configurable for hosts where
+    # this port is already assigned.
+    port: int = 5055
     debug: bool = False
 
     def __post_init__(self) -> None:
+        bind_host = str(self.host or "").strip()
+        if bind_host.casefold() not in {"127.0.0.1", "localhost", "::1"}:
+            raise ValueError(
+                "LegiView's web bind host must be a loopback address "
+                "(127.0.0.1, localhost, or ::1)"
+            )
+        port = _positive_int(self.port, "port", 1, 65535)
         project_root = _resolve_path(self.project_root, relative_to=PROJECT_ROOT)
         configured_database = _normalize_configured_path(
             self.database_path_configured
@@ -190,6 +200,8 @@ class AppConfig:
         object.__setattr__(self, "archive_root_configured", configured_archive)
         object.__setattr__(self, "minimum_free_space_gb", minimum_gb)
         object.__setattr__(self, "minimum_free_space_bytes", minimum_bytes)
+        object.__setattr__(self, "host", bind_host)
+        object.__setattr__(self, "port", port)
 
     @classmethod
     def from_env(cls, env_file: Path | None = None) -> "AppConfig":
@@ -260,7 +272,7 @@ class AppConfig:
             odata_base_url=os.environ.get("LEGIVIEW_ODATA_BASE_URL", ODATA_BASE_URL).rstrip("/") + "/",
             olis_base_url=os.environ.get("LEGIVIEW_OLIS_BASE_URL", OLIS_BASE_URL).rstrip("/") + "/",
             host=os.environ.get("LEGIVIEW_HOST", "127.0.0.1"),
-            port=_positive_int(os.environ.get("LEGIVIEW_PORT", 5000), "port", 1, 65535),
+            port=_positive_int(os.environ.get("LEGIVIEW_PORT", 5055), "port", 1, 65535),
             debug=_env_bool("LEGIVIEW_DEBUG"),
         )
 

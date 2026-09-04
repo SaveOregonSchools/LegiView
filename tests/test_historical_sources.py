@@ -14,6 +14,7 @@ from olis_archive.services.historical_sources import (
     validate_odata_metadata,
 )
 from olis_archive.services.odata import ODataPage
+from olis_archive.services.source_mapping import measure_scope_filter
 
 
 def _session(key: str, begin: str, name: str | None = None):
@@ -33,24 +34,97 @@ def test_official_session_scope_uses_boundary_chronology_and_keeps_special_sessi
         _session("2026R1", "2026-02-02T00:00:00"),
         _session("2014S1", "2014-09-15T00:00:00", "2014 Special Session"),
         _session("2013R1", "2013-02-04T00:00:00"),
+        _session("2015I1", "2015-12-01T00:00:00", "2015 Interim Session"),
         _session("2015R1", "2015-02-02T00:00:00"),
         _session("2014R1", "2014-02-03T00:00:00"),
     ]
 
     scope = resolve_historical_session_scope(rows)
 
-    assert scope.session_keys == ("2014R1", "2014S1", "2015R1", "2026R1")
+    assert scope.all_session_keys == (
+        "2013R1",
+        "2014R1",
+        "2014S1",
+        "2015R1",
+        "2015I1",
+        "2026R1",
+    )
+    assert tuple(row.session_key for row in scope.unsupported_sessions) == ("2013R1",)
+    assert scope.session_keys == (
+        "2014R1",
+        "2014S1",
+        "2015R1",
+        "2015I1",
+        "2026R1",
+    )
     assert "2013R1" not in scope.session_keys
     assert scope.session_keys[-1] == "2026R1"
     assert scope.requested_scope()["session_keys"] == list(scope.session_keys)
     assert scope.selected(["2026R1", "2014S1"]).session_keys == ("2014S1", "2026R1")
+    assert scope.selected_range("2014S1", "2015I1").session_keys == (
+        "2014S1",
+        "2015R1",
+        "2015I1",
+    )
     assert scope.is_at_or_after("2026R1", "2014R1")
     assert not scope.is_at_or_after("2014R1", "2015R1")
+
+
+def test_session_range_rejects_reversal_unknown_keys_and_older_official_rows():
+    scope = resolve_historical_session_scope(
+        [
+            _session("2013R1", "2013-02-04T00:00:00"),
+            _session("2014R1", "2014-02-03T00:00:00"),
+            _session("2014S1", "2014-09-15T00:00:00"),
+            _session("2015I1", "2015-12-01T00:00:00"),
+        ]
+    )
+
+    with pytest.raises(HistoricalSourceError, match="newer than To session"):
+        scope.selected_range("2015I1", "2014R1")
+    with pytest.raises(HistoricalSourceError, match="official catalogue.*2099R1"):
+        scope.selected_range("2014R1", "2099R1")
+    with pytest.raises(HistoricalSourceError, match="predate.*2014R1.*2013R1"):
+        scope.selected_range("2013R1", "2015I1")
+    with pytest.raises(HistoricalSourceError, match="official catalogue.*2099R1"):
+        scope.selected(["2014R1", "2099R1"])
 
 
 def test_official_session_scope_requires_exact_boundary_record():
     with pytest.raises(HistoricalSourceError, match="2014R1"):
         resolve_historical_session_scope([_session("2014S1", "2014-09-15T00:00:00")])
+
+
+def test_official_session_scope_retains_but_disables_incompatible_legacy_rows():
+    malformed_date = _session("LEGACY-A", "not-a-date", "Legacy import")
+    missing_key = _session("2001R1", "2001-01-01T00:00:00", "Missing key")
+    missing_key.pop("SessionKey")
+    scope = resolve_historical_session_scope(
+        [
+            malformed_date,
+            _session("2025R1", "not-a-date", "Malformed modern row"),
+            missing_key,
+            _session("1999R1", "1999-01-11T00:00:00", "1999 Regular Session"),
+            _session("2014R1", "2014-02-03T00:00:00"),
+            _session("2026R1", "2026-02-02T00:00:00"),
+        ]
+    )
+
+    assert scope.supported_session_keys == ("2014R1", "2026R1")
+    unsupported = {row.session_key: row for row in scope.unsupported_sessions}
+    assert "1999R1" in unsupported
+    assert "SessionKey" in unsupported["1999R1"].compatibility_issue
+    assert "LEGACY-A" in unsupported
+    assert "BeginDate" in unsupported["LEGACY-A"].compatibility_issue
+    assert "BeginDate" in unsupported["2025R1"].compatibility_issue
+    assert any("unusable official row" in key for key in unsupported)
+    guardrails = scope.requested_scope()["catalogue_guardrails"]
+    assert {row["session_key"] for row in guardrails} == set(unsupported)
+    with pytest.raises(
+        HistoricalSourceError,
+        match=r"incompatible.*2025R1.*BeginDate",
+    ):
+        scope.selected(["2025R1"])
 
 
 def test_official_session_scope_follows_all_odata_pages():
@@ -73,9 +147,10 @@ def test_official_session_scope_follows_all_odata_pages():
 
     scope = resolve_historical_session_scope_from_odata(Client())
     assert scope.session_keys == ("2014R1", "2014S1")
+    assert scope.all_session_keys == ("2013R1", "2014R1", "2014S1")
 
 
-def test_session_entity_plans_are_hb_sb_scoped_and_use_inclusive_watermark():
+def test_session_entity_plans_use_all_supported_prefixes_and_inclusive_watermark():
     plan = build_session_entity_plan(
         "CommitteePublicTestimonies",
         "2026R1",
@@ -84,7 +159,7 @@ def test_session_entity_plans_are_hb_sb_scoped_and_use_inclusive_watermark():
     assert plan.strategy == "watermark"
     assert plan.authoritative_presence is False
     assert "SessionKey eq '2026R1'" in plan.filter_expression
-    assert "(MeasurePrefix eq 'HB' or MeasurePrefix eq 'SB')" in plan.filter_expression
+    assert measure_scope_filter() in plan.filter_expression
     assert "CreatedDate ge datetime'2026-05-15T12:28:47'" in plan.filter_expression
     assert "ModifiedDate ge datetime'2026-05-15T12:28:47'" in plan.filter_expression
     assert " gt " not in plan.filter_expression
@@ -205,10 +280,22 @@ def test_stream_passes_control_only_to_explicitly_compatible_client():
     assert "cancellation_requested" not in observed["params"]
 
 
-def test_stream_rejects_rows_outside_hb_sb_session_scope():
-    bad = {
+def test_stream_accepts_supported_resolutions_and_rejects_unknown_prefixes():
+    supported = {
         "SessionKey": "2014R1",
         "MeasurePrefix": "HJR",
+        "MeasureNumber": 1,
+        "CreatedDate": "2014-01-01T00:00:00",
+    }
+    stream_session_entity(
+        _FakePagedClient((ODataPage((supported,), None, None, None),)),
+        build_session_entity_plan("Measures", "2014R1"),
+        lambda batch: None,
+    )
+
+    bad = {
+        "SessionKey": "2014R1",
+        "MeasurePrefix": "XYZ",
         "MeasureNumber": 1,
         "CreatedDate": "2014-01-01T00:00:00",
     }

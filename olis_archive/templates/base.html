@@ -3,11 +3,12 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="legiview-base-url" content="{{ app_base_url or url_for('home') }}">
     <title>{% block title %}LegiView{% endblock %}</title>
     <link rel="stylesheet" href="{{ url_for('static', filename='app.css') }}">
     {% block head_extra %}{% endblock %}
   </head>
-  <body>
+  <body data-app-base-url="{{ app_base_url or url_for('home') }}">
     <header class="site-header">
       <div class="brand">
         <a class="home-mark" href="{{ url_for('home') }}" aria-label="LegiView home">L</a>

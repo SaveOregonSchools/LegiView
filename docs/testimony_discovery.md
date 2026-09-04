@@ -1,9 +1,31 @@
 # Testimony and presentation discovery
 
 LegiView uses structured OData as the inventory source and one narrowly scoped OLIS
-bill page as a display-reconciliation source. It does not crawl arbitrary links or
+measure page as a display-reconciliation source. It does not crawl arbitrary links or
 use browser automation. Payload acquisition remains a separate Download Archive
 operation.
+
+## Supported legislative-measure scope
+
+The official Oregon Legislature measure taxonomy has six categories, each with a
+House- and Senate-origin form:
+
+| Official category | House-origin | Senate-origin |
+| --- | --- | --- |
+| Bill | `HB` | `SB` |
+| Joint Resolution | `HJR` | `SJR` |
+| Concurrent Resolution | `HCR` | `SCR` |
+| Resolution | `HR` | `SR` |
+| Joint Memorial | `HJM` | `SJM` |
+| Memorial | `HM` | `SM` |
+
+LegiView applies the same testimony-candidate and reconciliation rules to all 12
+prefixes. The initial `H` or `S` records the originating chamber; for joint and
+concurrent measures it does not mean that only the originating chamber acts. See the
+[official measure-types page](https://www.oregonlegislature.gov/citizen_engagement/Pages/Measure-Types.aspx)
+and [source mapping](source_mapping.md#legislative-measure-mapping-and-supported-prefixes).
+An unexpected prefix is treated as a source-contract issue instead of being guessed
+into a known category.
 
 ## Modern public testimony
 
@@ -12,7 +34,7 @@ For sessions with the modern testimony model, the official
 normalizes its logical document identity from:
 
 ```text
-session + bill + CommitteePublicTestimony + CommTestId
+session + measure + CommitteePublicTestimony + CommTestId
 ```
 
 The useful structured fields include submitter names, `BehalfOf`, organization,
@@ -21,7 +43,7 @@ description, position ID, committee, meeting date, source dates, and
 `3982` is Oppose, and `3983` is Support. Unknown IDs remain visible rather than being
 guessed.
 
-LegiView then requests the known bill Testimony page and parses its
+LegiView then requests the known measure Testimony page and parses its
 `ExhibitsTable`. The table is rendered in the initial HTML. Its JavaScript DataTables
 pagination is client-side, so there is no hidden Ajax endpoint or need to click every
 page. Links are read from the recognized table/section rather than counted globally,
@@ -68,8 +90,9 @@ because their title, submitter, filename, or hash matches.
 
 ## Candidate-page rules
 
-To avoid fetching an OLIS page for every HB/SB, a bill becomes a reconciliation
-candidate when its structured session inventory contains at least one of:
+To avoid fetching an OLIS page for every supported measure, a measure becomes a
+reconciliation candidate when its structured session inventory contains at least
+one of:
 
 - a `CommitteePublicTestimonies` row;
 - a committee document classified as presentation/legacy testimony capable;
@@ -79,7 +102,7 @@ candidate when its structured session inventory contains at least one of:
 
 Reasons are recorded from structured fields, not filename keywords. When structured
 evidence leaves a reasonable completeness risk, checking the one known page is
-preferred. Bills without a reason are explicitly `not_applicable`, not silently
+preferred. Measures without a reason are explicitly `not_applicable`, not silently
 treated as a successful zero-result page.
 
 ## Display-check states
@@ -105,12 +128,12 @@ Successful display results are durable. During an ordinary incremental inventory
 LegiView reuses a prior successful result for an unchanged candidate and requests
 OLIS again only for new/changed candidate evidence or a prior failed/anomalous page.
 A forced authoritative comparison deliberately rechecks all current candidates. If
-a successful authoritative source comparison proves a formerly anomalous bill is no
-longer a candidate, its stale current-state display anomalies are resolved rather
+a successful authoritative source comparison proves a formerly anomalous measure is
+no longer a candidate, its stale current-state display anomalies are resolved rather
 than leaving the session permanently incomplete.
 
 Reconciliation state is stored independently for the
-`CommitteePublicTestimony` and `CommitteeMeetingDocument` source families. A bill
+`CommitteePublicTestimony` and `CommitteeMeetingDocument` source families. A measure
 that legitimately exposes both cannot let one result overwrite the other, and a
 later successful check resolves only stale discrepancies for its own family before
 recording any mismatch that is still present.
@@ -128,6 +151,25 @@ The 2026-09-03 source spike established:
   committee documents;
 - `2015R1/HB2745` displayed exactly the 45 `Presentation` records among 50 structured
   committee documents.
+
+An additional bounded expanded-scope check on 2026-09-04 found 162 non-`HB`/`SB`
+measures in `2025R1` (`HCR` 42, `SCR` 34, `SJR` 34, `HJR` 22, `HJM` 14,
+`SJM` 10, `HR` 3, and `SR` 3). The equivalent `2014R1` query found 19 (`SCR`
+7, `HCR` 5, `SJR` 4, and one each of `HJM`, `SJM`, and `SR`). A targeted
+whole-catalogue query observed exact row `2007R1/HM1` with meaning `House
+Memorial`, but no `HM` at or after the supported `2014R1` boundary, and observed
+`SM` in supported sessions including `2017R1` and `2019R1`. A bounded exclusion
+query found no source prefix outside the 12-prefix catalogue. These are
+point-in-time query results, not enum guarantees or permanent statements of prefix
+availability.
+
+`2025R1/HJR11` provided the bounded non-bill testimony validation: structured
+queries returned 10 sponsors, one committee agenda item, two committee meeting
+documents, 114 `CommitteePublicTestimonies` rows, and zero floor letters. Its
+canonical OLIS testimony page was reachable at
+<https://olis.oregonlegislature.gov/liz/2025R1/Measures/Testimony/HJR11>. This
+confirms that candidate selection and source identity must be measure-generic;
+the observed counts are not a permanent cardinality assertion.
 
 The zero-byte record is retained as an auditable upstream discrepancy and truthful
 download failure. It is never promoted as a valid file or retried forever without an

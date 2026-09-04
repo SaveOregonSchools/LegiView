@@ -7,14 +7,14 @@
     <div>
       <p class="eyebrow">Legislative Collection</p>
       <h2>Collect a Session</h2>
-      <p class="heading-summary">Collect House Bills and Senate Bills from one explicitly selected session.</p>
+      <p class="heading-summary">Collect Oregon bills, resolutions, and memorials from one explicitly selected session.</p>
     </div>
     <a class="button-link" href="{{ url_for('runs') }}">Run history</a>
   </section>
 
   <div class="notice warning-note">
     <strong>Keep validation runs bounded.</strong>
-    <span>Session collection may discover many documents. Use a bill limit while validating configuration and archive capacity.</span>
+    <span>Session collection may discover many documents. Use a measure limit while validating configuration and archive capacity.</span>
   </div>
 
   <section class="tool-surface accent-collection">
@@ -29,9 +29,10 @@
             <option value="{{ session_value }}">{{ session.session_name or session.name or session_value }}</option>
           {% endfor %}
         </datalist>
+        <p class="field-note">Direct collection is limited to official sessions at or after the validated <code>2014R1</code> boundary.</p>
       </div>
       <div>
-        <label for="max_bills">Maximum bills <span class="optional">optional</span></label>
+        <label for="max_bills">Maximum measures <span class="optional">optional</span></label>
         <input id="max_bills" name="max_bills" type="number" min="1" value="{{ max_bills or '' }}" placeholder="For example, 10">
         <p class="field-note">Leave blank only when you intend to collect the complete selected session.</p>
       </div>
@@ -52,7 +53,7 @@
     <section class="content-section">
       <div class="section-heading-row"><h2>Recent Session Runs</h2><a class="text-link" href="{{ url_for('runs') }}">All runs</a></div>
       <div class="table-scroll"><table>
-        <thead><tr><th>Run</th><th>Session</th><th>Status</th><th>Stage</th><th>Bills</th><th>Errors</th><th>Started</th></tr></thead>
+        <thead><tr><th>Run</th><th>Session</th><th>Status</th><th>Stage</th><th>Measures</th><th>Errors</th><th>Started</th></tr></thead>
         <tbody>{% for run in recent_runs %}<tr>
           <td><a href="{{ url_for('run_detail', run_id=run.id) }}">#{{ run.id }}</a></td>
           <td>{{ run.session_key or run.scope_display or '—' }}</td>

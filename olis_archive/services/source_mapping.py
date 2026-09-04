@@ -8,10 +8,67 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import re
+from types import MappingProxyType
 from typing import Any, Mapping
 
 
-_BILL_RE = re.compile(r"^\s*(HB|SB)\s*[- ]?\s*(\d{1,6})\s*$", re.IGNORECASE)
+@dataclass(frozen=True, slots=True)
+class MeasurePrefixMetadata:
+    """Stable local meaning for one official Oregon measure prefix.
+
+    ``originating_chamber`` describes where the measure originates.  Joint and
+    concurrent measures can require action by both chambers, so it must not be
+    interpreted as saying that only one chamber acts on the measure.
+    """
+
+    measure_type: str
+    originating_chamber: str
+    official_meaning: str
+
+
+# Keep one explicit, reviewable catalogue rather than accepting arbitrary
+# letter prefixes.  The order is also used to build deterministic OData filters.
+MEASURE_PREFIX_METADATA: Mapping[str, MeasurePrefixMetadata] = MappingProxyType(
+    {
+        "HB": MeasurePrefixMetadata("bill", "House", "House Bill"),
+        "SB": MeasurePrefixMetadata("bill", "Senate", "Senate Bill"),
+        "HJR": MeasurePrefixMetadata(
+            "joint_resolution", "House", "House Joint Resolution"
+        ),
+        "SJR": MeasurePrefixMetadata(
+            "joint_resolution", "Senate", "Senate Joint Resolution"
+        ),
+        "HCR": MeasurePrefixMetadata(
+            "concurrent_resolution", "House", "House Concurrent Resolution"
+        ),
+        "SCR": MeasurePrefixMetadata(
+            "concurrent_resolution", "Senate", "Senate Concurrent Resolution"
+        ),
+        "HR": MeasurePrefixMetadata("resolution", "House", "House Resolution"),
+        "SR": MeasurePrefixMetadata("resolution", "Senate", "Senate Resolution"),
+        "HJM": MeasurePrefixMetadata(
+            "joint_memorial", "House", "House Joint Memorial"
+        ),
+        "SJM": MeasurePrefixMetadata(
+            "joint_memorial", "Senate", "Senate Joint Memorial"
+        ),
+        "HM": MeasurePrefixMetadata("memorial", "House", "House Memorial"),
+        "SM": MeasurePrefixMetadata("memorial", "Senate", "Senate Memorial"),
+    }
+)
+SUPPORTED_MEASURE_PREFIXES = tuple(MEASURE_PREFIX_METADATA)
+SUPPORTED_MEASURE_PREFIX_SET = frozenset(SUPPORTED_MEASURE_PREFIXES)
+SUPPORTED_MEASURE_TYPES = frozenset(
+    metadata.measure_type for metadata in MEASURE_PREFIX_METADATA.values()
+)
+_MEASURE_PREFIX_PATTERN = "|".join(
+    re.escape(prefix)
+    for prefix in sorted(SUPPORTED_MEASURE_PREFIXES, key=len, reverse=True)
+)
+_BILL_RE = re.compile(
+    rf"^\s*({_MEASURE_PREFIX_PATTERN})\s*[- ]?\s*(\d{{1,6}})\s*$",
+    re.IGNORECASE,
+)
 POSITION_MAP = {3981: "Neutral", 3982: "Oppose", 3983: "Support"}
 
 # These are the committee-document values observed during the Phase 1 source
@@ -35,6 +92,11 @@ class InvalidBillId(ValueError):
     pass
 
 
+# New code can use generic terminology while integrations importing the
+# original Phase 1 exception name remain source-compatible.
+InvalidMeasureId = InvalidBillId
+
+
 def normalize_session_key(value: str) -> str:
     key = re.sub(r"\s+", "", str(value or "")).upper()
     if not re.fullmatch(r"20\d{2}[A-Z][A-Z0-9]{0,4}", key):
@@ -45,20 +107,40 @@ def normalize_session_key(value: str) -> str:
 def normalize_bill_id(value: str) -> tuple[str, int, str, str]:
     match = _BILL_RE.fullmatch(str(value or ""))
     if not match:
-        raise InvalidBillId("Only House Bills and Senate Bills are supported (for example, SB1501)")
+        raise InvalidBillId(
+            "Unsupported Oregon legislative measure identifier "
+            "(for example, SB1501, HJR11, or SCR1)"
+        )
     prefix = match.group(1).upper()
     number = int(match.group(2))
     compact = f"{prefix}{number}"
     return prefix, number, compact, f"{prefix} {number}"
 
 
+normalize_measure_id = normalize_bill_id
+
+
+def normalize_measure_prefix(prefix: str) -> str:
+    normalized = str(prefix or "").strip().upper()
+    if normalized not in SUPPORTED_MEASURE_PREFIX_SET:
+        raise InvalidBillId(f"Unsupported measure prefix: {prefix!r}")
+    return normalized
+
+
 def chamber_for_prefix(prefix: str) -> str:
-    normalized = str(prefix or "").upper()
-    if normalized == "HB":
-        return "House"
-    if normalized == "SB":
-        return "Senate"
-    raise InvalidBillId(f"Unsupported measure prefix: {prefix!r}")
+    return MEASURE_PREFIX_METADATA[normalize_measure_prefix(prefix)].originating_chamber
+
+
+def measure_type_for_prefix(prefix: str) -> str:
+    return MEASURE_PREFIX_METADATA[normalize_measure_prefix(prefix)].measure_type
+
+
+def measure_scope_filter() -> str:
+    """Return the exact supported-prefix predicate for OData queries."""
+
+    return "(" + " or ".join(
+        f"MeasurePrefix eq '{prefix}'" for prefix in SUPPORTED_MEASURE_PREFIXES
+    ) + ")"
 
 
 def chamber_for_code(value: Any) -> str | None:
@@ -140,7 +222,7 @@ def classify_committee_document(document_type: Any) -> tuple[str, str]:
 
 
 def map_measure(raw: Mapping[str, Any]) -> dict[str, Any]:
-    prefix = str(raw["MeasurePrefix"]).upper()
+    prefix = normalize_measure_prefix(str(raw["MeasurePrefix"]))
     number = int(raw["MeasureNumber"])
     _, _, compact, display = normalize_bill_id(f"{prefix}{number}")
     return {
@@ -150,6 +232,7 @@ def map_measure(raw: Mapping[str, Any]) -> dict[str, Any]:
         "bill_id_compact": compact,
         "bill_id_display": display,
         "bill_chamber": chamber_for_prefix(prefix),
+        "measure_type": measure_type_for_prefix(prefix),
         "at_the_request_of": _text(raw.get("AtTheRequestOf")),
         "bill_title_source": "Measure.RelatingTo",
         "bill_title": _text(raw.get("RelatingTo")),

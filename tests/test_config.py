@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from olis_archive import create_app
 from olis_archive.config import (
     AppConfig,
     BYTES_PER_GB,
@@ -34,6 +35,12 @@ CONFIG_ENV_NAMES = (
     "LEGIVIEW_HOST",
     "LEGIVIEW_PORT",
     "LEGIVIEW_DEBUG",
+    "LEGIVIEW_URL_PREFIX",
+    "LEGIVIEW_TRUST_PROXY",
+    "LEGIVIEW_TRUSTED_HOSTS",
+    "LEGIVIEW_SECRET_KEY",
+    "LEGIVIEW_SESSION_COOKIE_SECURE",
+    "LEGIVIEW_WEB_THREADS",
 )
 
 
@@ -58,6 +65,41 @@ def test_default_paths_use_application_project_root_not_cwd(
     assert config.minimum_free_space_gb == 5
     assert config.minimum_free_space_bytes == 5 * BYTES_PER_GB
     assert config.snapshot()["project_root"] == str(PROJECT_ROOT)
+
+
+def test_web_bind_host_is_restricted_to_loopback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("LEGIVIEW_HOST", "0.0.0.0")
+
+    with pytest.raises(ValueError, match="loopback"):
+        AppConfig.from_env(tmp_path / "missing.env")
+
+    monkeypatch.setenv("LEGIVIEW_HOST", "::1")
+    assert AppConfig.from_env(tmp_path / "missing.env").host == "::1"
+
+
+def test_app_factory_applies_uppercase_flask_host_and_port_overrides(
+    tmp_path: Path,
+) -> None:
+    app = create_app(
+        {
+            "TESTING": True,
+            "START_WORKER": False,
+            "PROJECT_ROOT": tmp_path,
+            "DATABASE_PATH": tmp_path / "legiview.sqlite3",
+            "ARCHIVE_ROOT": tmp_path / "archive",
+            "MINIMUM_FREE_SPACE_BYTES": 0,
+            "HOST": "localhost",
+            "PORT": 5099,
+        }
+    )
+    try:
+        runtime = app.extensions["legiview"]["runtime"]
+        assert runtime.config.host == "localhost"
+        assert runtime.config.port == 5099
+    finally:
+        assert app.extensions["legiview"]["shutdown"]()
 
 
 def test_relative_paths_resolve_against_effective_project_root_not_cwd(
@@ -144,6 +186,26 @@ def test_runtime_database_override_replaces_retained_configured_path(tmp_path: P
     assert effective.database_path == root / "state" / "override.sqlite3"
     assert effective.database_path_configured == "state/override.sqlite3"
     assert Path(database.path) == effective.database_path
+
+
+def test_runtime_web_bind_overrides_are_applied_and_validated(tmp_path: Path) -> None:
+    base = AppConfig(
+        project_root=tmp_path,
+        database_path="data/default.sqlite3",
+        archive_root="archive",
+        minimum_free_space_bytes=0,
+    )
+
+    effective, _database, _storage = load_effective_config(
+        base,
+        overrides={"host": "localhost", "port": 5099},
+    )
+
+    assert effective.host == "localhost"
+    assert effective.port == 5099
+
+    with pytest.raises(ValueError, match="loopback"):
+        load_effective_config(base, overrides={"host": "0.0.0.0"})
 
 
 def test_absolute_database_archive_and_project_paths_remain_absolute(

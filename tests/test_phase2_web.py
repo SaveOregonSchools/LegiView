@@ -12,6 +12,8 @@ import pytest
 from olis_archive import create_app
 from olis_archive.services.archive_queries import ArchiveQueries
 from olis_archive.services.csv_exports import stream_query_csv
+from olis_archive.services.historical_sources import resolve_historical_session_scope
+from olis_archive.web import _official_session_rows
 
 
 @pytest.fixture
@@ -37,6 +39,29 @@ def _csrf(client) -> str:  # noqa: ANN001
     assert client.get("/inventory-backfill").status_code == 200
     with client.session_transaction() as browser_session:
         return str(browser_session["_csrf_token"])
+
+
+def _official_scope():  # noqa: ANN201
+    def session(key: str, name: str, begin: str):
+        return {
+            "SessionKey": key,
+            "SessionName": name,
+            "BeginDate": begin,
+            "EndDate": None,
+            "CreatedDate": begin,
+            "ModifiedDate": None,
+            "DefaultSession": key == "2026R1",
+        }
+
+    return resolve_historical_session_scope(
+        [
+            session("2013R1", "2013 Regular Session", "2013-02-04T00:00:00"),
+            session("2014R1", "2014 Regular Session", "2014-02-03T00:00:00"),
+            session("2014S1", "2014 Special Session", "2014-09-15T00:00:00"),
+            session("2015I1", "2015 Interim Session", "2015-12-01T00:00:00"),
+            session("2026R1", "2026 Regular Session", "2026-02-02T00:00:00"),
+        ]
+    )
 
 
 def _seed_scope(runtime) -> tuple[int, int]:  # noqa: ANN001
@@ -134,6 +159,129 @@ def test_historical_ui_and_export_fail_closed_without_boundary_session(phase2_ap
     assert rows == []
 
 
+def test_inventory_catalogue_shows_but_disables_pre_boundary_sessions(phase2_app):
+    runtime = phase2_app.extensions["legiview"]["runtime"]
+    scope = _official_scope()
+    for session in scope.sessions:
+        runtime.storage.upsert_session(
+            {
+                "session_key": session.session_key,
+                "source_session_id": session.session_key,
+                "session_name": session.session_name,
+                "session_year": int(session.session_key[:4]),
+                "begin_date": session.begin_date,
+            }
+        )
+
+    queries = ArchiveQueries(runtime.database)
+    supported = queries.session_choices()
+    complete = queries.session_choices(include_unsupported=True)
+    assert [row["session_key"] for row in supported] == [
+        "2026R1",
+        "2015I1",
+        "2014S1",
+        "2014R1",
+    ]
+    assert [row["session_key"] for row in complete] == [
+        "2026R1",
+        "2015I1",
+        "2014S1",
+        "2014R1",
+        "2013R1",
+    ]
+    assert complete[-1]["supported"] == 0
+
+    html = phase2_app.test_client().get("/inventory-backfill").get_data(as_text=True)
+    assert "2013 Regular Session" in html
+    assert "Predates the validated 2014R1 support boundary" in html
+    from_select = html.split('id="from_session"', 1)[1].split("</select>", 1)[0]
+    assert "2013R1" not in from_select
+    assert from_select.index("2026R1") < from_select.index("2015I1")
+    assert from_select.index("2015I1") < from_select.index("2014S1")
+    assert from_select.index("2014S1") < from_select.index("2014R1")
+
+
+def test_resolved_catalogue_metadata_takes_precedence_over_stale_archive_state():
+    scope = _official_scope()
+    stored = {
+        "2014R1": {
+            "session_key": "2014R1",
+            "session_name": "Stale stored session name",
+            "begin_date": "2014-01-01T00:00:00",
+            "end_date": "2014-01-02T00:00:00",
+            "inventory_status": "complete",
+            "measure_count": 42,
+        }
+    }
+
+    rows = _official_session_rows(scope, stored)
+    row = next(item for item in rows if item["session_key"] == "2014R1")
+
+    assert row["session_name"] == "2014 Regular Session"
+    assert row["begin_date"] == "2014-02-03T00:00:00"
+    assert row["end_date"] is None
+    assert row["inventory_status"] == "complete"
+    assert row["measure_count"] == 42
+
+
+def test_direct_collection_hides_and_rejects_pre_boundary_sessions(phase2_app):
+    runtime = phase2_app.extensions["legiview"]["runtime"]
+    runtime.storage.upsert_session(
+        {
+            "session_key": "2007R1",
+            "source_session_id": "2007R1",
+            "session_name": "2007 Regular Session",
+            "session_year": 2007,
+            "begin_date": "2007-01-08T00:00:00",
+        }
+    )
+    client = phase2_app.test_client()
+
+    for url in ("/collect/bill", "/collect/session"):
+        html = client.get(url).get_data(as_text=True)
+        datalist = html.split('id="session-options"', 1)[1].split(
+            "</datalist>", 1
+        )[0]
+        assert "2007R1" not in datalist
+
+    token = _csrf(client)
+    response = client.post(
+        "/collect/bill",
+        data={
+            "_csrf_token": token,
+            "session_key": "2007R1",
+            "bill_id": "HB2001",
+        },
+    )
+    assert response.status_code == 200
+    assert "predates LegiView&#39;s validated support boundary 2014R1" in (
+        response.get_data(as_text=True)
+    )
+    assert runtime.collection.runs.list_runs() == []
+
+
+def test_web_resume_rejects_legacy_frozen_scope_without_requeueing(phase2_app):
+    runtime = phase2_app.extensions["legiview"]["runtime"]
+    run_id = runtime.collection.runs.create_run(
+        "inventory_backfill",
+        session_keys=["2007R1"],
+        scope={"session_keys": ["2007R1"]},
+    )
+    assert runtime.collection.runs.claim_run(run_id)
+    runtime.storage.normalize_interrupted_work()
+
+    client = phase2_app.test_client()
+    response = client.post(
+        f"/runs/{run_id}/resume",
+        data={"_csrf_token": _csrf(client)},
+        follow_redirects=True,
+    )
+
+    assert response.status_code == 200
+    assert "cannot be resumed" in response.get_data(as_text=True)
+    assert runtime.collection.runs.get_run(run_id)["status"] == "interrupted"
+
+
 @pytest.mark.parametrize("url", ["/inventory-backfill", "/download-archive"])
 def test_phase2_start_actions_require_csrf(phase2_app, url: str):
     client = phase2_app.test_client()
@@ -147,23 +295,7 @@ def test_official_session_discovery_is_csrf_protected_post_only(
 ):
     runtime = phase2_app.extensions["legiview"]["runtime"]
     calls: list[str] = []
-    scope = SimpleNamespace(
-        session_keys=("2014R1", "2024S1"),
-        sessions=(
-            SimpleNamespace(
-                session_key="2014R1",
-                session_name="2014 Regular Session",
-                begin_date="2014-02-03T00:00:00",
-                end_date="2014-03-10T00:00:00",
-            ),
-            SimpleNamespace(
-                session_key="2024S1",
-                session_name="2024 Special Session",
-                begin_date="2024-05-29T00:00:00",
-                end_date="2024-05-29T00:00:00",
-            ),
-        ),
-    )
+    scope = _official_scope()
 
     def resolve_scope():
         calls.append("resolve")
@@ -191,7 +323,11 @@ def test_official_session_discovery_is_csrf_protected_post_only(
     assert response.status_code == 200
     assert calls == ["resolve"]
     assert "2014 Regular Session" in html
-    assert "2024 Special Session" in html
+    assert "2014 Special Session" in html
+    assert "2015 Interim Session" in html
+    assert "2013 Regular Session" in html
+    assert "Begins before the validated 2014R1 boundary" in html
+    assert 'id="from_session"' in html and 'id="to_session"' in html
     assert 'value="2014R1"' in html and "checked" in html
 
 
@@ -207,11 +343,30 @@ def test_historical_actions_snapshot_selected_ui_scope(phase2_app, monkeypatch):
     )
     calls: list[tuple[str, object]] = []
 
+    resolved = _official_scope()
+    scope_calls: list[str] = []
+
+    def resolve_scope():
+        scope_calls.append("resolve")
+        return resolved
+
     def create_inventory(  # noqa: ANN001
-        session_keys, *, probe_remote_sizes=False, force_full=False
+        session_keys=None,
+        *,
+        probe_remote_sizes=False,
+        force_full=False,
+        resolved_scope=None,
     ):
+        assert session_keys is None
         calls.append(
-            ("inventory", (tuple(session_keys), probe_remote_sizes, force_full))
+            (
+                "inventory",
+                (
+                    tuple(resolved_scope.session_keys),
+                    probe_remote_sizes,
+                    force_full,
+                ),
+            )
         )
         return 80
 
@@ -236,6 +391,7 @@ def test_historical_actions_snapshot_selected_ui_scope(phase2_app, monkeypatch):
         return 81
 
     monkeypatch.setattr(runtime.collection, "create_inventory_backfill_run", create_inventory)
+    monkeypatch.setattr(runtime.collection, "historical_session_scope", resolve_scope)
     monkeypatch.setattr(runtime.collection, "create_download_archive_run", create_download)
     monkeypatch.setattr(
         runtime.collection,
@@ -266,6 +422,7 @@ def test_historical_actions_snapshot_selected_ui_scope(phase2_app, monkeypatch):
     )
     assert inventory.status_code == 303
     assert inventory.headers["Location"].endswith("/runs/80")
+    assert scope_calls == ["resolve"]
 
     preview = client.post(
         "/download-archive",
@@ -297,6 +454,104 @@ def test_historical_actions_snapshot_selected_ui_scope(phase2_app, monkeypatch):
         "download",
         (("2026R1",), ("public_testimony",), False, True),
     )
+
+
+def test_inventory_range_queues_exact_inclusive_official_chronology(
+    phase2_app, monkeypatch
+):
+    runtime = phase2_app.extensions["legiview"]["runtime"]
+    scope = _official_scope()
+    resolutions: list[object] = []
+    created: list[object] = []
+
+    def resolve_scope():
+        resolutions.append(scope)
+        return scope
+
+    def create_inventory(
+        session_keys=None,
+        *,
+        probe_remote_sizes=False,
+        force_full=False,
+        resolved_scope=None,
+    ):
+        assert session_keys is None
+        assert probe_remote_sizes is False
+        assert force_full is False
+        created.append(resolved_scope)
+        return 83
+
+    monkeypatch.setattr(runtime.collection, "historical_session_scope", resolve_scope)
+    monkeypatch.setattr(
+        runtime.collection, "create_inventory_backfill_run", create_inventory
+    )
+    client = phase2_app.test_client()
+    token = _csrf(client)
+
+    response = client.post(
+        "/inventory-backfill",
+        data={
+            "_csrf_token": token,
+            "scope_mode": "range",
+            "from_session": "2014S1",
+            "to_session": "2026R1",
+        },
+    )
+
+    assert response.status_code == 303
+    assert response.headers["Location"].endswith("/runs/83")
+    assert resolutions == [scope]
+    assert len(created) == 1
+    assert created[0].sessions is scope.sessions
+    assert created[0].session_keys == ("2014S1", "2015I1", "2026R1")
+
+
+@pytest.mark.parametrize(
+    ("payload", "message"),
+    [
+        (
+            {"scope_mode": "range", "from_session": "2026R1", "to_session": "2014R1"},
+            "From session 2026R1 is newer than To session 2014R1",
+        ),
+        (
+            {"scope_mode": "range", "from_session": "2013R1", "to_session": "2014R1"},
+            "predate LegiView&#39;s validated support boundary 2014R1",
+        ),
+        (
+            {"scope_mode": "range", "from_session": "2014R1", "to_session": "2099R1"},
+            "not in the resolved official catalogue: 2099R1",
+        ),
+        (
+            {"scope_mode": "exact", "session_keys": ["2014R1", "2013R1"]},
+            "predate LegiView&#39;s validated support boundary 2014R1",
+        ),
+    ],
+)
+def test_inventory_scope_tampering_cannot_queue(
+    phase2_app, monkeypatch, payload, message
+):
+    runtime = phase2_app.extensions["legiview"]["runtime"]
+    scope = _official_scope()
+    created: list[object] = []
+    monkeypatch.setattr(
+        runtime.collection, "historical_session_scope", lambda: scope
+    )
+    monkeypatch.setattr(
+        runtime.collection,
+        "create_inventory_backfill_run",
+        lambda *args, **kwargs: created.append((args, kwargs)),
+    )
+    client = phase2_app.test_client()
+    token = _csrf(client)
+
+    response = client.post(
+        "/inventory-backfill", data={"_csrf_token": token, **payload}
+    )
+    html = response.get_data(as_text=True)
+
+    assert response.status_code == 200
+    assert message in html
+    assert created == []
 
 
 def test_download_archive_can_start_background_verification_only_scope(
@@ -676,6 +931,110 @@ def test_retry_all_invalid_run_filter_cannot_widen_scope(phase2_app):
     assert response.status_code == 200
     assert "No failed documents match" in response.get_data(as_text=True)
     assert len(runtime.collection.runs.list_runs()) == before
+
+
+def test_retry_ui_and_service_exclude_pre_boundary_documents(
+    phase2_app, monkeypatch
+):
+    runtime = phase2_app.extensions["legiview"]["runtime"]
+    runtime.storage.upsert_session(
+        {
+            "session_key": "2007R1",
+            "session_name": "2007 Regular Session",
+            "session_year": 2007,
+            "begin_date": "2007-01-08T00:00:00",
+        }
+    )
+    legacy_bill_id = runtime.storage.upsert_bill(
+        {
+            "session_key": "2007R1",
+            "measure_prefix": "HB",
+            "measure_number": 2001,
+        }
+    )
+    legacy_document_id = _seed_document(
+        runtime,
+        legacy_bill_id,
+        "legacy-retry",
+        canonical_download_url=(
+            "https://olis.oregonlegislature.gov/liz/2007R1/Downloads/"
+            "PublicTestimonyDocument/1"
+        ),
+    )
+    runtime.storage.update_document_download_state(
+        legacy_document_id,
+        "failed_retryable",
+        last_error="Legacy fixture failure",
+    )
+
+    client = phase2_app.test_client()
+    html = client.get("/retry-failures").get_data(as_text=True)
+    assert f'value="{legacy_document_id}"' not in html
+
+    before = len(runtime.collection.runs.list_runs())
+    response = client.post(
+        "/retry-failures",
+        data={
+            "_csrf_token": _csrf(client),
+            "document_ids": str(legacy_document_id),
+        },
+    )
+    assert response.status_code == 200
+    assert "Select at least one document to retry" in response.get_data(as_text=True)
+    assert len(runtime.collection.runs.list_runs()) == before
+
+    with pytest.raises(ValueError, match="2007R1.*2014R1"):
+        runtime.collection.create_retry_selected_run([legacy_document_id])
+
+    monkeypatch.setattr(
+        runtime.collection,
+        "_download_claimed_document",
+        lambda *_args, **_kwargs: pytest.fail("legacy retry reached downloader"),
+    )
+    legacy_retry = runtime.collection.runs.create_run(
+        "retry_failures",
+        session_key="2007R1",
+        scope={"document_ids": [legacy_document_id]},
+    )
+    assert runtime.collection.execute_run(legacy_retry) == "failed"
+
+
+def test_unfiltered_retry_snapshot_excludes_pre_boundary_documents(phase2_app):
+    runtime = phase2_app.extensions["legiview"]["runtime"]
+    _, supported_bill_id = _seed_scope(runtime)
+    supported_id = _seed_document(runtime, supported_bill_id, "supported-retry")
+    runtime.storage.update_document_download_state(
+        supported_id, "failed_retryable", last_error="Supported failure"
+    )
+    runtime.storage.upsert_session(
+        {
+            "session_key": "2007R1",
+            "session_name": "2007 Regular Session",
+            "session_year": 2007,
+            "begin_date": "2007-01-08T00:00:00",
+        }
+    )
+    legacy_bill_id = runtime.storage.upsert_bill(
+        {
+            "session_key": "2007R1",
+            "measure_prefix": "HB",
+            "measure_number": 2001,
+        }
+    )
+    legacy_id = _seed_document(runtime, legacy_bill_id, "legacy-retry")
+    runtime.storage.update_document_download_state(
+        legacy_id, "failed_retryable", last_error="Legacy failure"
+    )
+
+    run_id, count = runtime.collection.create_retry_matching_run()
+    items = [
+        row
+        for row in runtime.collection.runs.run_items(run_id)
+        if row["item_type"] == "document"
+    ]
+
+    assert count == 1
+    assert [row["document_id"] for row in items] == [supported_id]
 
 
 def test_source_links_require_https_and_an_allowlisted_official_host(phase2_app):

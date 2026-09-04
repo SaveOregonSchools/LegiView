@@ -24,20 +24,32 @@ def _parser() -> argparse.ArgumentParser:
     serve.add_argument("--host", help="override the configured bind host")
     serve.add_argument("--port", type=int, help="override the configured port")
 
-    bill = commands.add_parser("collect-bill", help="collect and archive one HB or SB")
+    bill = commands.add_parser(
+        "collect-bill",
+        help="collect and archive one legislative measure (legacy command name)",
+    )
     bill.add_argument("session_key")
-    bill.add_argument("bill_id")
+    bill.add_argument("bill_id", help="measure identifier such as SB1501 or HJR11")
+    measure = commands.add_parser(
+        "collect-measure", help="collect and archive one legislative measure"
+    )
+    measure.add_argument("session_key")
+    measure.add_argument("bill_id", help="measure identifier such as SB1501 or HJR11")
 
     session = commands.add_parser("collect-session", help="collect one explicitly selected session")
     session.add_argument("session_key")
-    session.add_argument("--max-bills", type=int)
+    session.add_argument(
+        "--max-bills",
+        type=int,
+        help="maximum measures to collect (option name retained for compatibility)",
+    )
 
     retry = commands.add_parser("retry-failures", help="explicitly retry failed downloads from a run")
     retry.add_argument("--run-id", type=int, required=True)
 
     inventory = commands.add_parser(
         "inventory-backfill",
-        help="inventory all official sessions since 2014R1 or selected sessions",
+        help="inventory a source-discovered supported session range or selected sessions",
     )
     inventory.add_argument(
         "--session",
@@ -89,9 +101,16 @@ def _parser() -> argparse.ArgumentParser:
             help="select only prior retryable/interrupted/changed/missing-local work",
         )
 
-    show = commands.add_parser("show-bill", help="show a stored bill and its related records")
+    show = commands.add_parser(
+        "show-bill", help="show a stored measure (legacy command name)"
+    )
     show.add_argument("session_key")
     show.add_argument("bill_id")
+    show_measure = commands.add_parser(
+        "show-measure", help="show a stored measure and its related records"
+    )
+    show_measure.add_argument("session_key")
+    show_measure.add_argument("bill_id")
 
     resume = commands.add_parser("resume-run", help="resume an interrupted or low-space-paused run")
     resume.add_argument("run_id", type=int)
@@ -107,17 +126,22 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "serve":
         from .web import create_app
 
-        app = create_app({"START_WORKER": True})
+        overrides: dict[str, Any] = {"START_WORKER": True}
+        if args.host is not None:
+            overrides["HOST"] = args.host
+        if args.port is not None:
+            overrides["PORT"] = args.port
+        app = create_app(overrides)
         runtime = app.extensions["legiview"]["runtime"]
         app.run(
-            host=args.host or runtime.config.host,
-            port=args.port or runtime.config.port,
+            host=runtime.config.host,
+            port=runtime.config.port,
             debug=runtime.config.debug,
             use_reloader=False,
         )
         return 0
 
-    read_only = args.command in {"show-bill", "archive-preflight"}
+    read_only = args.command in {"show-bill", "show-measure", "archive-preflight"}
     try:
         runtime = build_runtime(
             normalize_interrupted=not read_only,
@@ -128,12 +152,24 @@ def main(argv: list[str] | None = None) -> int:
         print(str(exc), file=sys.stderr)
         return 2
 
-    if args.command == "collect-bill":
-        run_id = runtime.collection.create_collect_bill_run(args.session_key, args.bill_id)
+    if args.command in {"collect-bill", "collect-measure"}:
+        try:
+            run_id = runtime.collection.create_collect_bill_run(
+                args.session_key, args.bill_id
+            )
+        except ValueError as exc:
+            print(f"Measure collection could not be created: {exc}", file=sys.stderr)
+            return 2
         return _execute_and_print(runtime.collection, run_id)
 
     if args.command == "collect-session":
-        run_id = runtime.collection.create_collect_session_run(args.session_key, max_bills=args.max_bills)
+        try:
+            run_id = runtime.collection.create_collect_session_run(
+                args.session_key, max_bills=args.max_bills
+            )
+        except ValueError as exc:
+            print(f"Session collection could not be created: {exc}", file=sys.stderr)
+            return 2
         return _execute_and_print(runtime.collection, run_id)
 
     if args.command == "retry-failures":
@@ -222,19 +258,24 @@ def main(argv: list[str] | None = None) -> int:
         return _execute_and_print(runtime.collection, run_id)
 
     if args.command == "resume-run":
-        if not runtime.collection.runs.requeue(args.run_id):
+        try:
+            requeued = runtime.collection.requeue_run(args.run_id)
+        except ValueError as exc:
+            print(f"Run #{args.run_id} cannot be resumed: {exc}", file=sys.stderr)
+            return 2
+        if not requeued:
             print(f"Run #{args.run_id} is not interrupted or paused.", file=sys.stderr)
             return 2
         return _execute_and_print(runtime.collection, args.run_id)
 
-    if args.command == "show-bill":
+    if args.command in {"show-bill", "show-measure"}:
         from .services.source_mapping import normalize_bill_id, normalize_session_key
 
         session_key = normalize_session_key(args.session_key)
         _, _, compact, _ = normalize_bill_id(args.bill_id)
         bill = runtime.storage.get_bill(session_key, compact)
         if bill is None:
-            print(f"No stored bill found for {session_key} / {compact}.", file=sys.stderr)
+            print(f"No stored measure found for {session_key} / {compact}.", file=sys.stderr)
             return 1
         payload: dict[str, Any] = {
             "bill": bill,

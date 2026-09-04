@@ -1,37 +1,38 @@
 {% extends "base.html" %}
 
-{% block title %}Browse Bills - LegiView{% endblock %}
+{% block title %}Browse Measures - LegiView{% endblock %}
 
 {% block content %}
   <section class="page-heading">
     <div>
       <p class="eyebrow">Browse Archive</p>
-      <h2>Browse Bills</h2>
-      <p class="heading-summary">Filter the bills currently stored in the local archive.</p>
+      <h2>Browse Measures</h2>
+      <p class="heading-summary">Filter the bills, resolutions, and memorials currently stored in the local archive.</p>
     </div>
-    <a class="button-link primary" href="{{ url_for('collect_bill') }}">Collect a bill</a>
+    <a class="button-link primary" href="{{ url_for('collect_bill') }}">Collect a measure</a>
   </section>
 
   <section class="tool-surface accent-browse">
     <form method="get" action="{{ url_for('bills') }}" class="filter-form">
       <div><label for="session">Session</label><select id="session" name="session"><option value="">All sessions</option>{% for session in session_options %}{% set value = session.session_key or session.key or session %}<option value="{{ value }}" {% if filters.session == value %}selected{% endif %}>{{ session.session_name or session.name or value }}</option>{% endfor %}</select></div>
       <div><label for="chamber">Chamber</label><select id="chamber" name="chamber"><option value="">House and Senate</option><option value="House" {% if filters.chamber == 'House' %}selected{% endif %}>House</option><option value="Senate" {% if filters.chamber == 'Senate' %}selected{% endif %}>Senate</option></select></div>
-      <div><label for="q">Bill ID or title</label><input id="q" name="q" value="{{ filters.q or '' }}" placeholder="SB1501 or infrastructure"></div>
+      <div><label for="q">Measure ID or title</label><input id="q" name="q" value="{{ filters.q or '' }}" placeholder="SB1501, HJR11, or infrastructure"></div>
       <div><label for="sponsor">Sponsor name or code</label><input id="sponsor" name="sponsor" value="{{ filters.sponsor or '' }}" placeholder="Smith or HED"></div>
       <div><label for="enacted">Enactment</label><select id="enacted" name="enacted"><option value="" {% if not filters.enacted %}selected{% endif %}>All</option><option value="enacted" {% if filters.enacted == 'enacted' %}selected{% endif %}>Chapter assigned</option><option value="not_enacted" {% if filters.enacted == 'not_enacted' %}selected{% endif %}>No chapter</option></select></div>
-      <div><label for="sort">Sort</label><select id="sort" name="sort"><option value="bill" {% if filters.sort == 'bill' %}selected{% endif %}>Session and bill</option><option value="title" {% if filters.sort == 'title' %}selected{% endif %}>Bill title</option><option value="chapter" {% if filters.sort == 'chapter' %}selected{% endif %}>Chapter number</option><option value="documents" {% if filters.sort == 'documents' %}selected{% endif %}>Document count</option><option value="last_sync" {% if filters.sort == 'last_sync' %}selected{% endif %}>Most recently synced</option></select></div>
+      <div><label for="sort">Sort</label><select id="sort" name="sort"><option value="bill" {% if filters.sort == 'bill' %}selected{% endif %}>Session and measure</option><option value="title" {% if filters.sort == 'title' %}selected{% endif %}>Measure title</option><option value="chapter" {% if filters.sort == 'chapter' %}selected{% endif %}>Chapter number</option><option value="documents" {% if filters.sort == 'documents' %}selected{% endif %}>Document count</option><option value="last_sync" {% if filters.sort == 'last_sync' %}selected{% endif %}>Most recently synced</option></select></div>
       <div class="form-actions"><button type="submit">Apply filters</button><a class="button-link" href="{{ url_for('bills') }}">Clear</a></div>
     </form>
   </section>
 
   <section class="content-section">
-    <div class="section-heading-row"><h2>Collected Bills</h2><span class="status-note">{{ pagination.total or rows|length or 0 }} result{% if (pagination.total or rows|length or 0) != 1 %}s{% endif %}</span></div>
+    <div class="section-heading-row"><h2>Collected Measures</h2><span class="status-note">{{ pagination.total or rows|length or 0 }} result{% if (pagination.total or rows|length or 0) != 1 %}s{% endif %}</span></div>
     {% if rows %}
       <div class="table-scroll"><table>
-        <thead><tr><th>Session</th><th>Bill</th><th>Chamber</th><th>Bill Title</th><th>Chapter</th><th>Sponsors</th><th>Documents</th><th>Last sync</th></tr></thead>
+        <thead><tr><th>Session</th><th>Measure</th><th>Type</th><th>Origin</th><th>Measure Title</th><th>Chapter</th><th>Sponsors</th><th>Documents</th><th>Last sync</th></tr></thead>
         <tbody>{% for row in rows %}<tr>
           <td>{{ row.session_key }}</td>
           <td><a class="record-link" href="{{ url_for('bill_detail', bill_id=row.id) }}">{{ row.bill_id_display or row.bill_id_compact }}</a></td>
+          <td>{{ (row.measure_type or 'unknown')|replace('_', ' ')|title }}</td>
           <td>{{ row.bill_chamber or row.chamber }}</td>
           <td class="title-cell">{{ row.bill_title or row.relating_to or '—' }}</td>
           <td>{{ row.chapter_number or '—' }}</td>
@@ -42,13 +43,13 @@
       </table></div>
       {% set prev_url = pagination.prev_url or pagination.previous_url %}
       {% set next_url = pagination.next_url %}
-      <nav class="pagination" aria-label="Bill result pages">
+      <nav class="pagination" aria-label="Measure result pages">
         {% if prev_url %}<a class="button-link" href="{{ prev_url }}">Previous</a>{% endif %}
         <span>Page {{ pagination.page or 1 }}{% if pagination.pages %} of {{ pagination.pages }}{% endif %}</span>
         {% if next_url %}<a class="button-link" href="{{ next_url }}">Next</a>{% endif %}
       </nav>
     {% else %}
-      <div class="empty-state"><strong>No bills match these filters.</strong><p>Adjust the filters or <a href="{{ url_for('collect_bill') }}">collect a bill</a>.</p></div>
+      <div class="empty-state"><strong>No measures match these filters.</strong><p>Adjust the filters or <a href="{{ url_for('collect_bill') }}">collect a measure</a>.</p></div>
     {% endif %}
   </section>
 {% endblock %}

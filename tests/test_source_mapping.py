@@ -5,10 +5,14 @@ import pytest
 from olis_archive.services.documents import committee_document, floor_letter_document
 from olis_archive.services.source_mapping import (
     InvalidBillId,
+    MEASURE_PREFIX_METADATA,
+    SUPPORTED_MEASURE_PREFIXES,
     chamber_for_prefix,
     classify_committee_document,
     map_measure,
     map_sponsor,
+    measure_scope_filter,
+    measure_type_for_prefix,
     normalize_bill_id,
     testimony_position as map_testimony_position,
 )
@@ -16,13 +20,19 @@ from olis_archive.services.source_mapping import (
 
 @pytest.mark.parametrize(
     ("raw", "expected"),
-    [("SB1501", ("SB", 1501, "SB1501", "SB 1501")), (" hb 4111 ", ("HB", 4111, "HB4111", "HB 4111"))],
+    [
+        ("SB1501", ("SB", 1501, "SB1501", "SB 1501")),
+        (" hb 4111 ", ("HB", 4111, "HB4111", "HB 4111")),
+        ("HJR 11", ("HJR", 11, "HJR11", "HJR 11")),
+        ("scr-1", ("SCR", 1, "SCR1", "SCR 1")),
+        ("SM1", ("SM", 1, "SM1", "SM 1")),
+    ],
 )
 def test_bill_id_normalization(raw, expected):
     assert normalize_bill_id(raw) == expected
 
 
-@pytest.mark.parametrize("raw", ["HJR1", "HB", "1501", "SB 1x", ""])
+@pytest.mark.parametrize("raw", ["HJR", "HZ1", "1501", "SB 1x", ""])
 def test_bill_id_rejects_out_of_scope_values(raw):
     with pytest.raises(InvalidBillId):
         normalize_bill_id(raw)
@@ -31,6 +41,35 @@ def test_bill_id_rejects_out_of_scope_values(raw):
 def test_chamber_mapping():
     assert chamber_for_prefix("HB") == "House"
     assert chamber_for_prefix("sb") == "Senate"
+    assert chamber_for_prefix("HJR") == "House"
+    assert chamber_for_prefix("sjm") == "Senate"
+
+
+def test_supported_measure_prefix_catalogue_and_odata_filter_are_complete():
+    assert SUPPORTED_MEASURE_PREFIXES == (
+        "HB",
+        "SB",
+        "HJR",
+        "SJR",
+        "HCR",
+        "SCR",
+        "HR",
+        "SR",
+        "HJM",
+        "SJM",
+        "HM",
+        "SM",
+    )
+    assert set(MEASURE_PREFIX_METADATA) == set(SUPPORTED_MEASURE_PREFIXES)
+    predicate = measure_scope_filter()
+    for prefix in SUPPORTED_MEASURE_PREFIXES:
+        assert predicate.count(f"MeasurePrefix eq '{prefix}'") == 1
+    assert measure_type_for_prefix("HB") == "bill"
+    assert measure_type_for_prefix("SJR") == "joint_resolution"
+    assert measure_type_for_prefix("HCR") == "concurrent_resolution"
+    assert measure_type_for_prefix("SR") == "resolution"
+    assert measure_type_for_prefix("HJM") == "joint_memorial"
+    assert measure_type_for_prefix("SM") == "memorial"
 
 
 def test_measure_mapping_preserves_source_dates_and_relating_fields(fixture_dir):
@@ -41,6 +80,22 @@ def test_measure_mapping_preserves_source_dates_and_relating_fields(fixture_dir)
     assert mapped["relating_to_full"].startswith("Relating to the Moda Center")
     assert mapped["effective_date"] == "2026-03-31T00:00:00"
     assert mapped["source_modified_at"] == "2026-08-24T12:39:28"
+
+
+def test_non_bill_measure_mapping_records_type_and_originating_chamber(fixture_dir):
+    raw = json.loads((fixture_dir / "measure_2026_sb1501.json").read_text())
+    raw.update(
+        MeasurePrefix="HJR",
+        MeasureNumber=11,
+        PrefixMeaning="House Joint Resolution",
+    )
+
+    mapped = map_measure(raw)
+
+    assert mapped["bill_id_compact"] == "HJR11"
+    assert mapped["bill_id_display"] == "HJR 11"
+    assert mapped["bill_chamber"] == "House"
+    assert mapped["measure_type"] == "joint_resolution"
 
 
 def test_only_observed_sponsor_values_are_semantically_mapped():

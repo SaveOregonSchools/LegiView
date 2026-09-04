@@ -1,7 +1,9 @@
 # OLIS source mapping
 
-Observed against the official Oregon Legislature services on **2026-09-03**. This
-file records observed source behavior; it is not an invented enum catalogue.
+Initially observed against the official Oregon Legislature services on
+**2026-09-03**, with the bounded expanded-measure checks noted below performed on
+**2026-09-04**. This file records observed source behavior; it is not an invented
+enum catalogue.
 Unknown values must be retained verbatim and surfaced rather than coerced into a
 known value.
 
@@ -15,6 +17,10 @@ known value.
   <https://api.oregonlegislature.gov/odata/odataservice.svc/$metadata>
 - Published data-model diagram:
   <https://www.oregonlegislature.gov/citizen_engagement/Documents/OLOData-Model.pdf>
+- Official legislative measure types:
+  <https://www.oregonlegislature.gov/citizen_engagement/Pages/Measure-Types.aspx>
+- Legislative drafting/measure-prefix reference:
+  <https://www.oregonlegislature.gov/la/Documents/administrator_manual2014.pdf>
 - Acceptable-use agreement:
   <https://www.oregonlegislature.gov/citizen_engagement/Documents/OLODataAcceptableUseAgreement.pdf>
 - OLIS:
@@ -103,22 +109,46 @@ Important exact metadata details:
 Observed `2026R1`: begin `2026-02-02T00:00:00`, nullable end date, session name
 `2026 Regular Session`.
 
-## Measure/bill mapping
+## Legislative-measure mapping and supported prefixes
+
+Oregon's official measure-types page describes six categories. LegiView supports
+the House- and Senate-origin prefix for each category, for 12 exact prefixes:
+
+| Official category | House-origin prefix and meaning | Senate-origin prefix and meaning | Local `measure_type` |
+| --- | --- | --- | --- |
+| Bill | `HB` — House Bill | `SB` — Senate Bill | `bill` |
+| Joint Resolution | `HJR` — House Joint Resolution | `SJR` — Senate Joint Resolution | `joint_resolution` |
+| Concurrent Resolution | `HCR` — House Concurrent Resolution | `SCR` — Senate Concurrent Resolution | `concurrent_resolution` |
+| Resolution | `HR` — House Resolution | `SR` — Senate Resolution | `resolution` |
+| Joint Memorial | `HJM` — House Joint Memorial | `SJM` — Senate Joint Memorial | `joint_memorial` |
+| Memorial | `HM` — House Memorial | `SM` — Senate Memorial | `memorial` |
+
+The first letter establishes the originating chamber: every `H...` prefix maps to
+`House`, and every `S...` prefix maps to `Senate`. For joint and concurrent
+measures, this is an origin rule, not a claim that only that chamber acts on the
+measure. The database retains the established bill-oriented table and identifier
+field names for compatibility, while `measure_type` makes the generic meaning
+explicit.
+
+This supported-prefix catalogue is deliberately exact. A new or unexpected source
+prefix is retained as a source-contract error for review rather than silently
+coerced into one of these meanings. Likewise, the observations below do not make
+the current set an undocumented promise about all past or future source values.
 
 | Source property | Local field | Observed rule |
 | --- | --- | --- |
 | `SessionKey` | `session_key` | Exact official key. |
-| `MeasurePrefix` | `measure_prefix` | LegiView scope is exact `HB`/`SB`. |
+| `MeasurePrefix` | `measure_prefix` | Exact member of the 12-prefix supported catalogue above. |
 | `MeasureNumber` | `measure_number` | `Edm.Int32`; do not store leading-zero display variants as the number. |
-| prefix + number | compact/display IDs | `SB1501` / `SB 1501`; chamber is House for `HB`, Senate for `SB`. |
-| `PrefixMeaning` | raw prefix meaning | Observed `House Bill` and `Senate Bill`; useful audit field. |
+| prefix + number | compact/display IDs | Examples: `SB1501` / `SB 1501` and `HJR11` / `HJR 11`; identity is canonicalized and checked against prefix and number. |
+| `PrefixMeaning` | raw prefix meaning | Preserve the source text as an audit field; the local type/chamber mapping comes from the explicit catalogue above. |
 | `AtTheRequestOf` | `at_the_request_of` | Preserve exact punctuation/text. |
 | `RelatingTo` | `bill_title` and `relating_to` | **Confirmed authoritative OLIS “Bill Title” display source.** |
 | `RelatingToFull` | `relating_to_full` | Preserve separately; it can be longer than the displayed Bill Title. |
 | `CatchLine` | `catchline` | First text shown under OLIS “Catchline/Summary”. |
 | `MeasureSummary` | `measure_summary` | Full digest/summary shown after the catchline. Preserve whitespace/raw source. |
 | `ChapterNumber` | `chapter_number` | Nullable string, not an integer in metadata. |
-| `EffectiveDate` | `effective_date` | Nullable official `Edm.DateTime`; do not infer from bill text when populated. |
+| `EffectiveDate` | `effective_date` | Nullable official `Edm.DateTime`; do not infer from measure text when populated. |
 | `Vetoed` | `vetoed` | Nullable boolean. |
 | `EmergencyClause` | `emergency_clause` | Nullable boolean. |
 | `CurrentVersion` | `current_version` | Nullable one-character string. |
@@ -126,6 +156,29 @@ Observed `2026R1`: begin `2026-02-02T00:00:00`, nullable end date, session name
 | `CurrentCommitteeCode` | `current_committee_code` | Nullable. |
 | `CurrentSubCommittee` | raw/current subcommittee | Nullable. |
 | `CreatedDate` / `ModifiedDate` | OData source dates | Preserve independently of local first-seen/last-synced timestamps. |
+
+### Bounded expanded-scope observations
+
+Filtered live OData queries on 2026-09-04 confirmed that the non-bill categories
+are populated within LegiView's supported historical range:
+
+| Session | Non-`HB`/`SB` rows | Counts by observed prefix |
+| --- | ---: | --- |
+| `2025R1` | 162 | `HCR` 42, `SCR` 34, `SJR` 34, `HJR` 22, `HJM` 14, `SJM` 10, `HR` 3, `SR` 3 |
+| `2014R1` | 19 | `SCR` 7, `HCR` 5, `SJR` 4, `HJM` 1, `SJM` 1, `SR` 1 |
+
+A targeted whole-catalogue check found `2007R1/HM1` with
+`PrefixMeaning=House Memorial`; no `HM` row was returned at or after the validated
+`2014R1` support boundary. `SM` was observed in supported sessions including
+`2017R1` and `2019R1`. A `$top=1` filter excluding every one of the 12 mapped
+prefixes returned no row. Those are bounded observations of the current source, not
+an enum guarantee or a promise that a new prefix can never appear.
+
+`2025R1/HJR11` was used as a bounded non-bill integration sample. Its structured
+queries returned 10 sponsor rows, one committee agenda item, two committee meeting
+documents, 114 public-testimony rows, and no floor letters. The canonical OLIS
+testimony page was also reachable at
+<https://olis.oregonlegislature.gov/liz/2025R1/Measures/Testimony/HJR11>.
 
 There is no `BillTitle` property. OLIS overview HTML was compared directly to OData:
 
@@ -175,7 +228,7 @@ has 12 `Member` rows: six chief and six regular.
 
 ## Committee context mapping
 
-`CommitteeAgendaItem` joins a bill by `SessionKey`, `MeasurePrefix`, and
+`CommitteeAgendaItem` joins a measure by `SessionKey`, `MeasurePrefix`, and
 `MeasureNumber`. Join its misspelled `CommitteCode` plus `SessionKey` to `Committee`.
 Join a meeting/document using the exact source `MeetingDate`, not a date-only value.
 
@@ -192,7 +245,7 @@ Observed example for `2014R1/HB4111`:
 
 `CommitteeMeetingDocument` supplies `CommitteeMeetingDocumentId`, session,
 committee, exact meeting timestamp, exhibit reference/title, submitter, raw
-`DocumentType`, optional bill prefix/number, official `DocumentUrl`, and source
+`DocumentType`, optional measure prefix/number, official `DocumentUrl`, and source
 created/modified dates.
 
 Raw values actually observed:
@@ -219,7 +272,7 @@ Safe normalization established in Phase 1 and retained in Phase 2:
 
 Official page pattern:
 
-`https://olis.oregonlegislature.gov/liz/<SESSION>/Measures/Testimony/<BILL>`
+`https://olis.oregonlegislature.gov/liz/<SESSION>/Measures/Testimony/<MEASURE>`
 
 Example:
 <https://olis.oregonlegislature.gov/liz/2026R1/Measures/Testimony/SB1501>
@@ -237,7 +290,7 @@ as follows:
 | `Organization` | OLIS “City or Organization”. |
 | `DocumentDescription` | Display title/type; observed `Testimony`, `Letter`, `Report`, and `Article`. |
 | `PositionOnMeasureId` | Preserve raw ID and map only confirmed values below. |
-| `SessionKey`, `MeasurePrefix`, `MeasureNumber` | Bill identity. |
+| `SessionKey`, `MeasurePrefix`, `MeasureNumber` | Legislative-measure identity. |
 | `CommitteeCode`, `MeetingDate` | Join to committee and meeting. |
 | `PdfCreatedFlag` | Raw readiness flag; it is not sufficient proof of valid bytes. |
 | `DocumentUrl` | Not a file URL in the observed records; it was only the session root. |
@@ -254,9 +307,9 @@ Preserve any unrecognized ID and leave its normalized position unknown.
 
 The metadata declares an unusual composite entity key containing
 `CommitteeCode`, `CommTestId`, `CreatedDate`, `MeetingDate`, `PdfCreatedFlag`,
-`SubmitterFirstName`, and `SubmitterLastName`. The tested bill had unique
+`SubmitterFirstName`, and `SubmitterLastName`. The tested measure had unique
 `CommTestId` values. LegiView's cross-source document identity should still include
-session + bill + source entity type + numeric ID so document families cannot collide.
+session + measure + source entity type + numeric ID so document families cannot collide.
 
 ### HTML shape and pagination
 
@@ -323,7 +376,7 @@ Deduplicate the HTML and OData representations by
 
 ## Floor letters
 
-`FloorLetter` supplies `FloorLetterId`, nullable bill prefix/number, session,
+`FloorLetter` supplies `FloorLetterId`, nullable measure prefix/number, session,
 `LetterDate`, one-character `Chamber`, `LetterDescription`, `LetterTitle`, and
 `FloorLetterUrl`. Observed chamber values on `2026R1/SB1501` were `S` and `H`, mapped
 to Senate and House while retaining the raw value. Current metadata supplies no
@@ -371,19 +424,20 @@ here and checks the live `$metadata` contract before trusting a full backfill.
 
 | Entity set | Stable ordering/key fields used by inventory | Incremental source-date fields | Presence strategy |
 | --- | --- | --- | --- |
-| `Measures` | `MeasurePrefix`, `MeasureNumber` | `CreatedDate`, `ModifiedDate` | HB/SB-only full session comparison; inclusive watermark on later incremental runs. |
+| `Measures` | `MeasurePrefix`, `MeasureNumber` | `CreatedDate`, `ModifiedDate` | Supported-measure full session comparison; inclusive watermark on later incremental runs. |
 | `Legislators` | `LegislatorCode` | `CreatedDate`, `ModifiedDate` | Session-scoped reference upsert; inclusive watermark supported. |
 | `Committees` | `CommitteeCode` | `CreatedDate`, `ModifiedDate` | Session-scoped reference upsert; inclusive watermark supported. |
-| `MeasureSponsors` | `MeasureSponsorId` | `CreatedDate`, `ModifiedDate` | HB/SB-only upsert; official `LegislatoreCode` spelling retained. |
+| `MeasureSponsors` | `MeasureSponsorId` | `CreatedDate`, `ModifiedDate` | Supported-measure upsert; official `LegislatoreCode` spelling retained. |
 | `CommitteeMeetings` | `CommitteeCode`, `MeetingDate` | `CreatedDate`, `ModifiedDate` | Session-scoped upsert. |
-| `CommitteeAgendaItems` | `CommitteeAgendaItemId` | `CreatedDate`, `ModifiedDate` | HB/SB-only upsert; official `CommitteCode` spelling retained. |
-| `CommitteeMeetingDocuments` | `CommitteeMeetingDocumentId` | `CreatedDate`, `ModifiedDate` | HB/SB-only structured document inventory. |
-| `CommitteePublicTestimonies` | `CommTestId` | `CreatedDate`, `ModifiedDate` | HB/SB-only primary modern testimony inventory. |
-| `FloorLetters` | `FloorLetterId` | none in current metadata | Complete session/HB/SB comparison every time; never a fabricated watermark. |
+| `CommitteeAgendaItems` | `CommitteeAgendaItemId` | `CreatedDate`, `ModifiedDate` | Supported-measure upsert; official `CommitteCode` spelling retained. |
+| `CommitteeMeetingDocuments` | `CommitteeMeetingDocumentId` | `CreatedDate`, `ModifiedDate` | Supported-measure structured document inventory. |
+| `CommitteePublicTestimonies` | `CommTestId` | `CreatedDate`, `ModifiedDate` | Supported-measure primary modern testimony inventory. |
+| `FloorLetters` | `FloorLetterId` | none in current metadata | Complete session/supported-measure comparison every time; never a fabricated watermark. |
 
 Every request includes an exact `SessionKey` predicate. Measure-scoped sets also use
-`MeasurePrefix eq 'HB' or MeasurePrefix eq 'SB'`. Returned rows are validated against
-that scope; an out-of-scope session or prefix is a source error rather than something
+one shared exact predicate enumerating `HB`, `SB`, `HJR`, `SJR`, `HCR`, `SCR`, `HR`,
+`SR`, `HJM`, `SJM`, `HM`, and `SM`. Returned rows are validated against that scope;
+an out-of-scope session or unsupported prefix is a source error rather than something
 silently persisted.
 
 The initial/forced-full strategy is authoritative only after every continuation page
@@ -422,7 +476,16 @@ merely to estimate size.
 The probe is advisory. Unknown sizes remain eligible, and the sum of known lengths is
 reported as a lower bound rather than as a complete storage forecast.
 
-## Representative bills and fixture candidates
+## Representative measures and fixture candidates
+
+### `2025R1/HJR11` (expanded-scope sample)
+
+- Exercises the same structured measure, sponsor, agenda, committee-document, and
+  public-testimony identities used by the generic collection pipeline.
+- The bounded source counts were 10 sponsors, one agenda item, two committee
+  documents, 114 public-testimony rows, and zero floor letters.
+- These counts are a point-in-time validation sample, not a permanent cardinality
+  assertion.
 
 ### `2026R1/SB1501` (required modern sample)
 
@@ -469,6 +532,10 @@ and already satisfies the pre-2021 requirement.
   later appear.
 - Only observed sponsor and document values above are mapped. The strings are not an
   exhaustive promise for future sessions.
+- The 12 supported measure prefixes come from the official six-category mapping,
+  but the session counts and observed historical presence of individual prefixes
+  are point-in-time findings. They are not used as undocumented source enums or
+  guarantees that a prefix will appear in a particular session.
 - The three observed testimony position IDs are confirmed for the tested modern
   session, not presumed universal forever.
 - A `Presentation` title can say “testimony”, “letter”, or something else. Without

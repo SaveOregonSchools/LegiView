@@ -13,8 +13,9 @@ unrelated or empty lookalike directory trees are rejected without cleanup.
 
 Phase 1 enforces exclusive mutation ownership with an operating-system lock file next
 to SQLite. A second web server or mutating CLI command against the same database is
-rejected before startup recovery or workers run. The `show-bill` command disables
-startup recovery and is safe to use concurrently as a read-only inspection command.
+rejected before startup recovery or workers run. The `show-measure` command (and the
+compatible legacy `show-bill` alias) disables startup recovery and is safe to use
+concurrently as a read-only inspection command.
 The lock coordinates LegiView processes; it cannot protect against unrelated programs
 editing archive files directly.
 
@@ -52,7 +53,7 @@ assumed to identify the same thing as an equal floor-letter or committee-documen
 The canonical database identity is:
 
 ```text
-session + bill + source entity type + source document ID
+session + measure + source entity type + source document ID
 ```
 
 The normalized document kinds are `public_testimony`, `legacy_testimony`,
@@ -77,7 +78,7 @@ stable fallback. LegiView:
 - removes unsafe trailing spaces and periods;
 - guards reserved device names such as `CON`, `NUL`, `COM1`, and `LPT1`;
 - limits component length;
-- accepts only validated session, bill, kind, and numeric-ID components; and
+- accepts only validated session, measure, kind, and numeric-ID components; and
 - applies a MIME/signature-supported extension when the source name is ambiguous.
 
 The server-reported remote filename is stored separately when available. The official

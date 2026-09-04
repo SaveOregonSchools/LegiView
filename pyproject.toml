@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "legiview"
-version = "0.2.0"
+version = "0.3.0"
 description = "Durable local Oregon legislative data and document archive"
 requires-python = ">=3.11"
 license = "AGPL-3.0-only"
@@ -15,6 +15,7 @@ dependencies = [
 
 [project.optional-dependencies]
 test = ["pytest>=8.4,<10"]
+server = ["gunicorn>=26.2,<27"]
 
 [project.scripts]
 legiview = "olis_archive.__main__:main"

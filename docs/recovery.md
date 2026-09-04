@@ -66,7 +66,7 @@ active claims become interrupted/recoverable, while a second worker cannot claim
 same row concurrently.
 
 Inside an interrupted inventory session, a prior successful OLIS page check is
-reused only when its bill, testimony/presentation, and agenda observations do not
+reused only when its measure, testimony/presentation, and agenda observations do not
 postdate that check. This comparison uses persisted observation times rather than
 only the run ID, so a same-run resume avoids duplicate page requests while genuinely
 new or refreshed candidate inputs are checked again.
@@ -88,7 +88,7 @@ historical Download Archive run, that means the original session keys, document-
 and status filters, and inventory cutoff remain unchanged.
 
 Retry Failures creates a separate durable attempt from selected failures belonging
-to a targeted Phase 1 bill/session run:
+to a targeted measure/session run:
 
 ```powershell
 .\.venv\Scripts\python.exe -m olis_archive retry-failures --run-id <source-run-id>
@@ -103,12 +103,12 @@ database-claimed workflow instead of materializing failure IDs into a run snapsh
 
 That bulk mode excludes terminal failures. To deliberately reattempt one, review and
 select it on the **Retry Failures** page. The targeted CLI command can include
-terminal failures from a Phase 1 bill/session source run, but rejects historical
+terminal failures from a targeted measure/session source run, but rejects historical
 bulk run IDs so their scope cannot be materialized as an unbounded ID snapshot.
 
 On **Retry Failures**, **Queue selected retries** snapshots only the checked rows on
 the current page. **Queue all matching failures** instead freezes every eligible
-document matching the current run/session/bill filters as durable SQL-backed run
+document matching the current run/session/measure filters as durable SQL-backed run
 items. It does not place the full ID set in run JSON or an in-memory queue, and a
 document repaired after the snapshot is skipped without changing its valid state.
 
@@ -132,7 +132,7 @@ through an explicit operator action; it is never promoted as a valid version.
 ## Idempotency and immutable payloads
 
 Inventory uses stable source keys and upserts, so repeating a completed session does
-not duplicate sessions, bills, sponsors, source documents, or logical documents.
+not duplicate sessions, measures, sponsors, source documents, or logical documents.
 Incremental watermarks overlap inclusively. A failed query does not advance its
 cursor, and only a complete authoritative comparison can mark retained rows missing.
 

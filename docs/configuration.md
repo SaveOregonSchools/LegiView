@@ -29,8 +29,14 @@ LEGIVIEW_HTML_CONCURRENCY=1
 LEGIVIEW_MIN_FREE_SPACE_GB=5
 LEGIVIEW_INTER_REQUEST_DELAY=0.25
 LEGIVIEW_HOST=127.0.0.1
-LEGIVIEW_PORT=5000
+LEGIVIEW_PORT=5055
 LEGIVIEW_DEBUG=0
+
+LEGIVIEW_URL_PREFIX=/
+LEGIVIEW_TRUST_PROXY=0
+# LEGIVIEW_TRUSTED_HOSTS=legiview.example.internal
+# LEGIVIEW_SECRET_KEY=replace-with-a-persistent-random-value
+LEGIVIEW_SESSION_COOKIE_SECURE=0
 ```
 
 With no path variables set, the effective locations are:
@@ -86,7 +92,7 @@ personal/shared directory (for example, Documents), a filesystem root, a file, o
 linked/reparse-point alias. On locked startup LegiView creates a small
 `.legiview-archive-root` ownership marker before archive-wide maintenance. An empty
 directory is eligible for initialization. A marker-less Phase 1/2 archive is adopted
-only when every entry matches the exact session/bill/document-kind/source-ID layout
+only when every entry matches the exact session/measure/document-kind/source-ID layout
 and at least one regular payload provides positive legacy-archive evidence; an
 arbitrary or merely archive-shaped nonempty directory is rejected without deleting
 or changing anything.
@@ -129,10 +135,15 @@ delete the old generic key.
 | `LEGIVIEW_MIN_FREE_SPACE_GB` | `5` | Free space to preserve, in 1024³-byte GB. |
 | `LEGIVIEW_MIN_FREE_SPACE_BYTES` | unset | Deprecated fallback used only when the GB setting is absent. |
 | `LEGIVIEW_INTER_REQUEST_DELAY` | `0.25` | Minimum delay between requests in seconds. |
-| `LEGIVIEW_HOST` | `127.0.0.1` | Flask bind host. |
-| `LEGIVIEW_PORT` | `5000` | Flask port. |
+| `LEGIVIEW_HOST` | `127.0.0.1` | Loopback-only Flask/Gunicorn bind host (`127.0.0.1`, `localhost`, or `::1`). Non-loopback values are rejected. |
+| `LEGIVIEW_PORT` | `5055` | Dedicated Flask/Gunicorn loopback port. |
 | `LEGIVIEW_DEBUG` | `0` | Flask debug mode; keep disabled for normal use. |
-| `LEGIVIEW_SECRET_KEY` | generated per start | Optional fixed Flask session secret. |
+| `LEGIVIEW_URL_PREFIX` | `/` | Public application root, such as `/legiview`; also scopes the unique `legiview_session` cookie. |
+| `LEGIVIEW_TRUST_PROXY` | `0` | Trust exactly one proxy hop for forwarded client, protocol, host, and prefix headers. Enable only while the backend is loopback-only. |
+| `LEGIVIEW_TRUSTED_HOSTS` | none beyond loopback/bind host | Comma-separated public Host allowlist; no wildcard is added implicitly. |
+| `LEGIVIEW_SECRET_KEY` | generated per start in direct mode | Persistent Flask session secret. In trusted-proxy mode it must replace the example placeholder and contain at least 32 characters. |
+| `LEGIVIEW_SESSION_COOKIE_SECURE` | `0` | Send the session cookie only over HTTPS when set to `1`. |
+| `LEGIVIEW_WEB_THREADS` | `4` | Thread count used by the supplied one-process Gunicorn configuration; allowed range 1–16. |
 
 The official service endpoints and download-host allowlist have safe application
 defaults. Changing source endpoints is a development/testing capability, not a way
@@ -147,3 +158,8 @@ settings under which work actually ran even if Settings later changes.
 
 The default network identity begins with `LegiView/<version>` and includes the Save
 Oregon Schools site. Keep a descriptive User-Agent when making requests.
+
+For a production Ubuntu service behind Nginx at a subpath, see
+[Ubuntu and Nginx subpath deployment](linux_nginx.md). The supplied server setup
+uses exactly one Gunicorn process because the application owns one exclusive
+database/archive mutation lock and one in-process durable-run dispatcher.

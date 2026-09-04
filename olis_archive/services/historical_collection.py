@@ -29,6 +29,7 @@ from .historical_sources import (
     SessionScope,
     build_session_entity_plan,
     resolve_historical_session_scope_from_odata,
+    require_supported_session_key,
     stream_session_entity,
     testimony_reconciliation_candidate,
     validate_odata_metadata,
@@ -54,6 +55,7 @@ from .runs import RunStore
 from .source_mapping import (
     map_measure,
     map_sponsor,
+    normalize_bill_id,
     normalize_session_key,
 )
 from .storage import DOCUMENT_KINDS, StorageService
@@ -242,8 +244,13 @@ class HistoricalCollectionService:
         *,
         probe_remote_sizes: bool = False,
         force_full: bool = False,
+        resolved_scope: SessionScope | None = None,
     ) -> int:
-        resolved_scope = self.historical_session_scope()
+        # Web range selection resolves the official catalogue once, validates
+        # both endpoints on that immutable snapshot, and passes the resulting
+        # exact selection here.  CLI callers omit this argument and retain the
+        # same authoritative discovery behavior.
+        resolved_scope = resolved_scope or self.historical_session_scope()
         scope = resolved_scope
         if session_keys is not None:
             scope = scope.selected(session_keys)
@@ -262,10 +269,16 @@ class HistoricalCollectionService:
                 probe_remote_sizes=probe_remote_sizes,
                 config_snapshot=self.config.snapshot(),
             )
-            # Persist the complete officially resolved chronology, including the
-            # boundary row, even when this run selects only a later subset.  Read
-            # models can therefore fail closed if the boundary cannot be proven.
+            # Persist the complete officially resolved chronology, including
+            # visible pre-boundary rows, even when this run selects only a later
+            # subset. Read models can therefore fail closed if the boundary
+            # cannot be proven without silently hiding older official sessions.
             for session in resolved_scope.sessions:
+                if session.compatibility_issue is not None:
+                    # The frozen scope retains the source key and diagnostic,
+                    # but incompatible catalogue rows must not enter tables or
+                    # collection code whose key/date invariants they violate.
+                    continue
                 self.storage.upsert_session(map_session(session.raw), run_id=run_id)
         return run_id
 
@@ -408,7 +421,10 @@ class HistoricalCollectionService:
     def execute_inventory_backfill(
         self, run_id: int, scope: Mapping[str, Any]
     ) -> dict[str, Any]:
-        sessions = tuple(normalize_session_key(value) for value in scope.get("session_keys", ()))
+        sessions = tuple(
+            require_supported_session_key(value)
+            for value in scope.get("session_keys", ())
+        )
         if not sessions:
             raise ValueError("Inventory Backfill has no frozen session scope")
         probe_sizes = bool(scope.get("probe_remote_sizes"))
@@ -498,7 +514,10 @@ class HistoricalCollectionService:
     def execute_download_archive(
         self, run_id: int, scope: Mapping[str, Any]
     ) -> dict[str, Any]:
-        sessions = tuple(normalize_session_key(value) for value in scope.get("session_keys", ()))
+        sessions = tuple(
+            require_supported_session_key(value)
+            for value in scope.get("session_keys", ())
+        )
         if not sessions:
             raise ValueError("Download Archive has no frozen session scope")
         for session_key in sessions:
@@ -1556,11 +1575,14 @@ class HistoricalCollectionService:
 
     def _bill_from_source_row(self, raw: Mapping[str, Any]) -> dict[str, Any]:
         session_key = normalize_session_key(str(raw["SessionKey"]))
-        prefix = str(raw.get("MeasurePrefix") or "").strip().upper()
-        number = integer(raw.get("MeasureNumber"))
-        if prefix not in {"HB", "SB"} or number is None:
-            raise ValueError("Historical child row had no valid HB/SB identity")
-        compact = f"{prefix}{number}"
+        try:
+            prefix, number, compact, _ = normalize_bill_id(
+                f"{raw.get('MeasurePrefix') or ''}{raw.get('MeasureNumber') or ''}"
+            )
+        except ValueError as exc:
+            raise ValueError(
+                "Historical child row had no valid supported measure identity"
+            ) from exc
         if self._cached_session == session_key and self._cached_bills is None:
             with self.database.connection() as connection:
                 rows = connection.execute(
@@ -1734,7 +1756,7 @@ class HistoricalCollectionService:
             # ID and would force thousands of already-successful HTML requests.
             # Local observation timestamps provide the required ordering.  A
             # page is reusable only when both family checks happened at or after
-            # every bill/document/agenda input that can affect reconciliation.
+            # every measure/document/agenda input that can affect reconciliation.
             checked_at = min(str(row["checked_at"]) for row in rows)
             changed = connection.execute(
                 """
@@ -1835,10 +1857,20 @@ class HistoricalCollectionService:
                     ORDER BY s.begin_date,s.session_key
                     """
                 ).fetchall()
-            sessions = tuple(str(row["session_key"]) for row in rows)
+            supported: list[str] = []
+            for row in rows:
+                try:
+                    supported.append(
+                        require_supported_session_key(str(row["session_key"]))
+                    )
+                except ValueError:
+                    continue
+            sessions = tuple(supported)
         else:
             sessions = tuple(
-                dict.fromkeys(normalize_session_key(value) for value in session_keys)
+                dict.fromkeys(
+                    require_supported_session_key(value) for value in session_keys
+                )
             )
         if not sessions:
             raise ValueError("No inventoried sessions were selected")

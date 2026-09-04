@@ -18,7 +18,9 @@ import xml.etree.ElementTree as ET
 
 from .odata import ODataPage, odata_datetime_literal, odata_literal
 from .source_mapping import (
+    SUPPORTED_MEASURE_PREFIX_SET,
     classify_committee_document_detail,
+    measure_scope_filter,
     normalize_session_key,
 )
 
@@ -31,53 +33,191 @@ class HistoricalSourceError(ValueError):
     """The official source did not satisfy a required inventory invariant."""
 
 
+def require_supported_session_key(
+    value: str,
+    *,
+    boundary_key: str = HISTORICAL_SESSION_BOUNDARY,
+) -> str:
+    """Normalize a direct-collection session and enforce the validated era.
+
+    Official catalogue range selection performs the more precise BeginDate
+    comparison. This year floor is the fail-closed guard for targeted CLI/UI
+    entry before a catalogue snapshot or source request exists.
+    """
+
+    key = normalize_session_key(value)
+    boundary = normalize_session_key(boundary_key)
+    if int(key[:4]) < int(boundary[:4]):
+        raise HistoricalSourceError(
+            f"Session {key} predates LegiView's validated support boundary "
+            f"{boundary}; choose {boundary} or a later official session"
+        )
+    return key
+
+
 @dataclass(frozen=True, slots=True)
 class OfficialSession:
     session_key: str
     session_name: str | None
-    begin_date: str
+    begin_date: str | None
     end_date: str | None
     source_created_at: str | None
     source_modified_at: str | None
     default_session: bool | None
     raw: Mapping[str, Any]
+    compatibility_issue: str | None = None
 
     @property
     def chronology(self) -> datetime:
+        if self.compatibility_issue or not self.begin_date:
+            raise HistoricalSourceError(
+                f"Official session {self.session_key} cannot be ordered for collection: "
+                f"{self.compatibility_issue or 'missing BeginDate'}"
+            )
         return _parse_source_datetime(self.begin_date, field="BeginDate")
 
 
 @dataclass(frozen=True, slots=True)
 class SessionScope:
-    """Immutable exact session selection suitable for run-scope JSON."""
+    """Official session catalogue plus an immutable supported selection.
+
+    ``sessions`` deliberately retains the complete official catalogue.  The
+    validated collection boundary is a separate concern: ``session_keys``
+    exposes either every supported session or the exact supported selection
+    made through :meth:`selected` / :meth:`selected_range`.  Keeping those two
+    concepts separate prevents an older official row from disappearing from
+    discovery while also preventing it from being queued accidentally.
+    """
 
     boundary_key: str
     sessions: tuple[OfficialSession, ...]
+    selected_keys: tuple[str, ...] | None = None
+
+    @property
+    def boundary_session(self) -> OfficialSession:
+        for session in self.sessions:
+            if session.session_key == self.boundary_key:
+                return session
+        # The resolver establishes this invariant before constructing a scope.
+        raise HistoricalSourceError(
+            f"Official LegislativeSessions did not contain required boundary {self.boundary_key}"
+        )
+
+    @property
+    def all_session_keys(self) -> tuple[str, ...]:
+        return tuple(session.session_key for session in self.sessions)
+
+    @property
+    def supported_sessions(self) -> tuple[OfficialSession, ...]:
+        boundary_date = self.boundary_session.chronology
+        return tuple(
+            session
+            for session in self.sessions
+            if session.compatibility_issue is None
+            and session.chronology >= boundary_date
+        )
+
+    @property
+    def unsupported_sessions(self) -> tuple[OfficialSession, ...]:
+        supported = set(self.supported_session_keys)
+        return tuple(
+            session for session in self.sessions if session.session_key not in supported
+        )
+
+    @property
+    def supported_session_keys(self) -> tuple[str, ...]:
+        return tuple(session.session_key for session in self.supported_sessions)
 
     @property
     def session_keys(self) -> tuple[str, ...]:
-        return tuple(session.session_key for session in self.sessions)
+        return self.supported_session_keys if self.selected_keys is None else self.selected_keys
 
     def selected(self, session_keys: Iterable[str]) -> "SessionScope":
         requested = tuple(dict.fromkeys(normalize_session_key(key) for key in session_keys))
-        by_key = {session.session_key: session for session in self.sessions}
-        unknown = [key for key in requested if key not in by_key]
+        if not requested:
+            raise HistoricalSourceError("Select at least one supported official session")
+        all_keys = set(self.all_session_keys)
+        supported_keys = set(self.supported_session_keys)
+        unknown = [key for key in requested if key not in all_keys]
         if unknown:
             raise HistoricalSourceError(
-                "Selected sessions are outside the resolved historical scope: "
+                "Selected sessions are not in the resolved official catalogue: "
                 + ", ".join(unknown)
+            )
+        unsupported = [key for key in requested if key not in supported_keys]
+        if unsupported:
+            by_key = {session.session_key: session for session in self.sessions}
+            incompatible = [
+                key
+                for key in unsupported
+                if by_key[key].compatibility_issue is not None
+            ]
+            if incompatible:
+                details = "; ".join(
+                    f"{key}: {by_key[key].compatibility_issue}"
+                    for key in incompatible
+                )
+                raise HistoricalSourceError(
+                    "Selected official sessions are incompatible with LegiView's "
+                    f"validated session schema: {details}"
+                )
+            raise HistoricalSourceError(
+                "Selected sessions predate LegiView's validated support boundary "
+                f"{self.boundary_key} ({self.boundary_session.begin_date}): "
+                + ", ".join(unsupported)
             )
         requested_set = set(requested)
         # Preserve official chronology, not checkbox/request ordering.
         return SessionScope(
             self.boundary_key,
-            tuple(session for session in self.sessions if session.session_key in requested_set),
+            self.sessions,
+            tuple(
+                session.session_key
+                for session in self.supported_sessions
+                if session.session_key in requested_set
+            ),
+        )
+
+    def selected_range(self, from_session: str, to_session: str) -> "SessionScope":
+        """Select every supported official session between two endpoints.
+
+        Endpoints and expansion are evaluated against this one immutable
+        catalogue snapshot.  The slice follows official ``BeginDate``
+        chronology (with the resolver's deterministic key tie-break), so
+        regular, special, short, and interim sessions are treated uniformly.
+        """
+
+        start = normalize_session_key(from_session)
+        end = normalize_session_key(to_session)
+        # ``selected`` supplies the precise unknown/unsupported diagnostics.
+        self.selected((start, end))
+        ordered = self.supported_session_keys
+        start_index = ordered.index(start)
+        end_index = ordered.index(end)
+        if start_index > end_index:
+            raise HistoricalSourceError(
+                f"From session {start} is newer than To session {end}; "
+                "choose endpoints in oldest-to-newest chronological order"
+            )
+        return SessionScope(
+            self.boundary_key,
+            self.sessions,
+            ordered[start_index : end_index + 1],
         )
 
     def requested_scope(self) -> dict[str, Any]:
         return {
             "boundary_session_key": self.boundary_key,
+            "boundary_begin_date": self.boundary_session.begin_date,
             "session_keys": list(self.session_keys),
+            "catalogue_guardrails": [
+                {
+                    "session_key": session.session_key,
+                    "reason": session.compatibility_issue,
+                }
+                for session in self.sessions
+                if session.compatibility_issue is not None
+            ],
         }
 
     def is_at_or_after(self, session_key: str, comparison_session_key: str) -> bool:
@@ -98,26 +238,51 @@ def resolve_historical_session_scope(
     *,
     boundary_key: str = HISTORICAL_SESSION_BOUNDARY,
 ) -> SessionScope:
-    """Resolve every official session chronologically at/after ``boundary_key``.
+    """Resolve the complete catalogue and establish the supported boundary.
 
     The boundary is found in the official rows and compared using official
-    ``BeginDate`` values.  No assumptions are made about regular/special session
-    suffixes or odd/even years.
+    ``BeginDate`` values.  Older rows are retained for visible discovery but
+    excluded from ``SessionScope.session_keys``.  No assumptions are made about
+    regular/special/interim suffixes or odd/even years.
     """
 
     boundary = normalize_session_key(boundary_key)
     by_key: dict[str, OfficialSession] = {}
-    for value in rows:
+    parsed_dates: dict[str, datetime] = {}
+    for row_number, value in enumerate(rows, start=1):
         raw = dict(value)
-        try:
-            key = normalize_session_key(str(raw["SessionKey"]))
-            begin_date = _required_text(raw.get("BeginDate"), "BeginDate", source_id=key)
-        except KeyError as exc:
-            raise HistoricalSourceError("LegislativeSessions row has no SessionKey") from exc
+        source_key = _text(raw.get("SessionKey"))
+        compatibility_issues: list[str] = []
+        if source_key is None:
+            key = f"[unusable official row {row_number}]"
+            compatibility_issues.append("The official row has no SessionKey")
+        else:
+            try:
+                key = normalize_session_key(source_key)
+            except ValueError:
+                # Retain the source spelling for operator visibility, but never
+                # feed an unrecognized key into collection or persistence.
+                key = source_key
+                compatibility_issues.append(
+                    "SessionKey does not match LegiView's validated modern format"
+                )
+        begin_date = _text(raw.get("BeginDate"))
+        parsed_begin: datetime | None = None
+        if begin_date is None:
+            compatibility_issues.append("The official row has no BeginDate")
+        else:
+            try:
+                parsed_begin = _parse_source_datetime(
+                    begin_date, field=f"{key}.BeginDate"
+                )
+            except HistoricalSourceError:
+                compatibility_issues.append(
+                    f"BeginDate is not a supported source date: {begin_date!r}"
+                )
         if key in by_key:
             raise HistoricalSourceError(f"Duplicate official legislative session {key}")
-        # Parse eagerly so one malformed date cannot silently perturb ordering.
-        _parse_source_datetime(begin_date, field=f"{key}.BeginDate")
+        if parsed_begin is not None:
+            parsed_dates[key] = parsed_begin
         by_key[key] = OfficialSession(
             session_key=key,
             session_name=_text(raw.get("SessionName")),
@@ -127,21 +292,32 @@ def resolve_historical_session_scope(
             source_modified_at=_text(raw.get("ModifiedDate")),
             default_session=_bool_or_none(raw.get("DefaultSession")),
             raw=MappingProxyType(raw),
+            compatibility_issue="; ".join(compatibility_issues) or None,
         )
     if boundary not in by_key:
         raise HistoricalSourceError(
             f"Official LegislativeSessions did not contain required boundary {boundary}"
         )
-    boundary_date = by_key[boundary].chronology
-    selected = tuple(
+    if by_key[boundary].compatibility_issue is not None:
+        raise HistoricalSourceError(
+            f"Official boundary session {boundary} is incompatible: "
+            f"{by_key[boundary].compatibility_issue}"
+        )
+    # Unorderable legacy rows sort before dated rows. The UI reverses this
+    # catalogue for display, keeping modern supported sessions first while
+    # still exposing every guarded legacy row.
+    catalogue = tuple(
         sorted(
-            (session for session in by_key.values() if session.chronology >= boundary_date),
-            key=lambda session: (session.chronology, session.session_key),
+            by_key.values(),
+            key=lambda session: (
+                parsed_dates.get(session.session_key) or datetime.min,
+                session.session_key,
+            ),
         )
     )
-    if not selected or boundary not in {session.session_key for session in selected}:
+    if boundary not in {session.session_key for session in catalogue}:
         raise HistoricalSourceError(f"Unable to establish historical boundary {boundary}")
-    return SessionScope(boundary, selected)
+    return SessionScope(boundary, catalogue)
 
 
 class ODataPageClient(Protocol):
@@ -216,7 +392,8 @@ ENTITY_SYNC_SPECS: Mapping[str, EntitySyncSpec] = MappingProxyType(
             ("CreatedDate", "ModifiedDate"), True,
         ),
         # Current metadata exposes neither CreatedDate nor ModifiedDate here.
-        # Re-fetch and compare the complete session/HB/SB set by FloorLetterId.
+        # Re-fetch and compare the complete supported-measure session set by
+        # FloorLetterId.
         "FloorLetters": EntitySyncSpec(
             "FloorLetters", "FloorLetterId", ("FloorLetterId",), (), True,
         ),
@@ -257,7 +434,7 @@ def build_session_entity_plan(
     session = normalize_session_key(session_key)
     clauses = [f"SessionKey eq {odata_literal(session)}"]
     if spec.measure_scoped:
-        clauses.append("(MeasurePrefix eq 'HB' or MeasurePrefix eq 'SB')")
+        clauses.append(measure_scope_filter())
 
     watermark = _text(source_watermark)
     use_watermark = bool(watermark and spec.supports_watermark and not force_full)
@@ -555,9 +732,9 @@ def _validate_scoped_item(plan: SessionEntityPlan, item: Mapping[str, Any]) -> N
         )
     if plan.spec.measure_scoped:
         prefix = (_text(item.get("MeasurePrefix")) or "").upper()
-        if prefix not in {"HB", "SB"}:
+        if prefix not in SUPPORTED_MEASURE_PREFIX_SET:
             raise HistoricalSourceError(
-                f"{plan.spec.entity_set} returned out-of-scope MeasurePrefix {prefix!r}"
+                f"{plan.spec.entity_set} returned unsupported MeasurePrefix {prefix!r}"
             )
 
 
@@ -645,6 +822,7 @@ __all__ = [
     "build_session_entity_plan",
     "resolve_historical_session_scope",
     "resolve_historical_session_scope_from_odata",
+    "require_supported_session_key",
     "stream_session_entity",
     "testimony_reconciliation_candidate",
     "validate_odata_metadata",

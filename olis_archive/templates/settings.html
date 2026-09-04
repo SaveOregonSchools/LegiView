@@ -18,7 +18,7 @@
       <div class="full">
         <label for="archive_root">Archive root</label>
         <input id="archive_root" name="archive_root" value="{{ settings.archive_root_configured or settings.archive_root or '' }}" required spellcheck="false">
-        <p class="field-note">Files are retained under <code>&lt;archive root&gt;/&lt;session&gt;/&lt;bill&gt;/&lt;kind&gt;/&lt;source id&gt;/</code>.</p>
+        <p class="field-note">Files are retained under <code>&lt;archive root&gt;/&lt;session&gt;/&lt;measure&gt;/&lt;kind&gt;/&lt;source id&gt;/</code>.</p>
         {% if settings.archive_root_configured != settings.archive_root %}<p class="field-note">Resolved archive path: <code>{{ settings.archive_root }}</code></p>{% endif %}
       </div>
       <div>

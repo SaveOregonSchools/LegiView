@@ -28,7 +28,7 @@
   <section class="stat-grid compact" aria-label="Run status">
     <div class="stat"><span class="stat-label">Status</span><strong><span class="status {{ run.status }}">{{ (run.status or 'unknown')|replace('_', ' ') }}</span></strong></div>
     <div class="stat"><span class="stat-label">Current stage</span><strong class="stat-date">{{ (run.stage or '—')|replace('_', ' ') }}</strong></div>
-    <div class="stat"><span class="stat-label">Bills/items</span><strong>{{ run.items_completed or run.bills_completed or 0 }} / {{ run.items_total or run.bills_planned or 0 }}</strong></div>
+    <div class="stat"><span class="stat-label">Measures/items</span><strong>{{ run.items_completed or run.bills_completed or 0 }} / {{ run.items_total or run.bills_planned or 0 }}</strong></div>
     <div class="stat"><span class="stat-label">Documents discovered</span><strong>{{ run.documents_discovered or 0 }}</strong></div>
     <div class="stat"><span class="stat-label">Documents downloaded</span><strong>{{ run.documents_downloaded or 0 }}</strong></div>
     <div class="stat"><span class="stat-label">Skipped valid</span><strong>{{ run.documents_skipped or run.skipped_count or 0 }}</strong></div>
@@ -49,8 +49,8 @@
       <table class="key-table"><tbody>
         <tr><th>Type</th><td>{{ (run.run_type or run.type or '—')|replace('_', ' ') }}</td></tr>
         <tr><th>Session</th><td>{{ run.session_key or '—' }}</td></tr>
-        <tr><th>Bill</th><td>{{ run.bill_id_display or run.bill_id_compact or '—' }}</td></tr>
-        <tr><th>Maximum bills</th><td>{{ run.max_bills or 'Not limited' }}</td></tr>
+        <tr><th>Measure</th><td>{{ run.bill_id_display or run.bill_id_compact or '—' }}</td></tr>
+        <tr><th>Maximum measures</th><td>{{ run.max_bills or 'Not limited' }}</td></tr>
         {% if run.session_keys %}<tr><th>Frozen sessions</th><td>{{ run.session_keys|join(', ') }}</td></tr>{% endif %}
         {% if run.scope_cutoff_at %}<tr><th>Scope cutoff</th><td>{{ run.scope_cutoff_at }}</td></tr>{% endif %}
         {% if run.run_type == 'inventory_backfill' %}
@@ -95,7 +95,7 @@
     <h2>Run Items</h2>
     {% if items %}
       <div class="table-scroll"><table>
-        <thead><tr><th>Session / Bill / Document</th><th>Stage</th><th>Status</th><th>Progress</th><th>Attempts</th><th>Activity / counts</th><th>Updated</th></tr></thead>
+        <thead><tr><th>Session / Measure / Document</th><th>Stage</th><th>Status</th><th>Progress</th><th>Attempts</th><th>Activity / counts</th><th>Updated</th></tr></thead>
         <tbody>{% for item in items %}<tr><td>{{ item.label or item.bill_id_display or item.document_title or item.source_document_id or '—' }}{% if item.inventory_status %}<div class="table-note">{{ item.inventory_status|replace('_', ' ') }}</div>{% endif %}</td><td>{{ (item.stage or '—')|replace('_', ' ') }}</td><td><span class="status {{ item.status }}">{{ (item.status or 'unknown')|replace('_', ' ') }}</span></td><td>{{ item.progress_current or 0 }}{% if item.progress_total is not none %} / {{ item.progress_total }}{% endif %}</td><td>{{ item.attempt_count or 0 }}</td><td>{{ item.message or item.error_message or '—' }}{% if item.detail_summary %}<div class="table-note">{{ item.detail_summary }}</div>{% endif %}</td><td>{{ item.updated_at or item.finished_at or '—' }}</td></tr>{% endfor %}</tbody>
       </table></div>
       <nav class="pagination" aria-label="Run item pages">{% if item_pagination.prev_url %}<a class="button-link" href="{{ item_pagination.prev_url }}">Previous</a>{% endif %}<span>Page {{ item_pagination.page }}{% if item_pagination.pages %} of {{ item_pagination.pages }}{% endif %} · {{ item_pagination.total or 0 }} items</span>{% if item_pagination.next_url %}<a class="button-link" href="{{ item_pagination.next_url }}">Next</a>{% endif %}</nav>

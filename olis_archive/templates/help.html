@@ -7,7 +7,7 @@
     <div>
       <p class="eyebrow">Configuration</p>
       <h2>Help and Data Sources</h2>
-      <p class="help-summary">LegiView is a local, provenance-first archive for Oregon House Bills and Senate Bills. Phase 2 adds durable historical inventory, explicit completeness, and a separately started archive downloader without destructive mirroring.</p>
+      <p class="help-summary">LegiView is a local, provenance-first archive for Oregon bills, resolutions, and memorials. It provides durable historical inventory, explicit completeness, and a separately started archive downloader without destructive mirroring.</p>
     </div>
   </section>
 
@@ -16,22 +16,22 @@
   <section class="help-section" id="historical">
     <h3>Historical Inventory and Archive Download</h3>
     <ol class="workflow-steps">
-      <li><div><strong>Resolve and select official sessions.</strong><p><a href="{{ url_for('inventory_backfill') }}">Inventory Backfill</a> uses official LegislativeSessions chronology and includes every session at or after 2014R1 by default.</p></div></li>
-      <li><div><strong>Build the inventory.</strong><p>The durable run catalogs HB/SB data, reconciles OData and required OLIS displays, records anomalies and explicit completeness, and never silently downloads payloads.</p></div></li>
+      <li><div><strong>Resolve and select official sessions.</strong><p><a href="{{ url_for('inventory_backfill') }}">Inventory Backfill</a> scans the complete official LegislativeSessions catalogue, shows older unsupported sessions, and lets you choose an inclusive supported range using official chronology.</p></div></li>
+      <li><div><strong>Build the inventory.</strong><p>The durable run catalogs supported Oregon measure types, reconciles OData and required OLIS displays, records anomalies and explicit completeness, and never silently downloads payloads.</p></div></li>
       <li><div><strong>Review completeness.</strong><p><a href="{{ url_for('session_status') }}">Session Status</a> shows document-kind totals, source anomalies, probe totals, failures, and last successful activity.</p></div></li>
       <li><div><strong>Preview and start downloads separately.</strong><p><a href="{{ url_for('download_archive') }}">Download Archive</a> freezes selected sessions, kinds, statuses, and a creation-time cutoff. Known pending bytes are checked against the free-space floor.</p></div></li>
     </ol>
   </section>
 
   <section class="help-section" id="collecting">
-    <h3>Collecting a Bill</h3>
+    <h3>Collecting a Measure</h3>
     <ol class="workflow-steps">
-      <li><div><strong>Choose the official session and bill.</strong><p>Enter a session key such as <code>2026R1</code> and an HB/SB identifier such as <code>SB1501</code>.</p></div></li>
+      <li><div><strong>Choose the official session and measure.</strong><p>Enter a session key such as <code>2026R1</code> and an identifier such as <code>SB1501</code>, <code>HJR11</code>, or <code>SCR1</code>.</p></div></li>
       <li><div><strong>Follow the durable run.</strong><p>The run detail page shows explicit stages from session/reference loading through discovery, download, and finalization.</p></div></li>
-      <li><div><strong>Review the archived bill.</strong><p>Bill detail separates chief and regular sponsors and groups testimony, presentations, floor letters, and other committee documents.</p></div></li>
-      <li><div><strong>Retry only what failed.</strong><p>Completed files that still exist and validate are skipped; retry does not require recollecting the entire bill.</p></div></li>
+      <li><div><strong>Review the archived measure.</strong><p>Measure detail separates chief and regular sponsors and groups testimony, presentations, floor letters, and other committee documents.</p></div></li>
+      <li><div><strong>Retry only what failed.</strong><p>Completed files that still exist and validate are skipped; retry does not require recollecting the entire measure.</p></div></li>
     </ol>
-    <div class="action-row"><a class="button-link primary" href="{{ url_for('collect_bill') }}">Collect a bill</a><a class="button-link" href="{{ url_for('collect_session') }}">Collect a session</a></div>
+    <div class="action-row"><a class="button-link primary" href="{{ url_for('collect_bill') }}">Collect a measure</a><a class="button-link" href="{{ url_for('collect_session') }}">Collect a session</a></div>
   </section>
 
   <section class="help-section" id="runs">
@@ -58,7 +58,7 @@
     <div class="source-card-grid">
       <a class="source-card" href="https://www.oregonlegislature.gov/citizen_engagement/Pages/data.aspx" target="_blank" rel="noopener"><strong>Oregon Legislative Data</strong><span>Official API entry point and data model</span></a>
       <a class="source-card" href="https://api.oregonlegislature.gov/odata/odataservice.svc/" target="_blank" rel="noopener"><strong>OData Service</strong><span>Measure, committee, member, and document metadata</span></a>
-      <a class="source-card" href="https://olis.oregonlegislature.gov/" target="_blank" rel="noopener"><strong>OLIS</strong><span>Official bill pages and testimony displays</span></a>
+      <a class="source-card" href="https://olis.oregonlegislature.gov/" target="_blank" rel="noopener"><strong>OLIS</strong><span>Official measure pages and testimony displays</span></a>
       <a class="source-card" href="https://www.oregonlegislature.gov/citizen_engagement/Documents/OLODataAcceptableUseAgreement.pdf" target="_blank" rel="noopener"><strong>Acceptable-Use Agreement</strong><span>Read and agree before live collection</span></a>
     </div>
     <div class="notice warning-note"><strong>Operator responsibility</strong><span>The operator confirmed that they reviewed and agreed to the Oregon Legislature Open Data agreement; no separate submission form was observed during the 2026-09-03 validation. Continue to follow the published terms, and use any official acceptance mechanism if one appears. LegiView does not automate acceptance, bypass access controls, evade rate limits, or conceal its User-Agent.</span></div>

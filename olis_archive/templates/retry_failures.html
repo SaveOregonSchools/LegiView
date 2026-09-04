@@ -23,7 +23,7 @@
     <form method="get" action="{{ url_for('retry_failures') }}" class="filter-form">
       <div><label for="run_id">Run ID</label><input id="run_id" name="run_id" type="number" min="1" value="{{ filters.run_id or '' }}"></div>
       <div><label for="session">Session</label><input id="session" name="session" value="{{ filters.session or '' }}" placeholder="2026R1"></div>
-      <div><label for="bill">Bill</label><input id="bill" name="bill" value="{{ filters.bill or '' }}" placeholder="SB1501"></div>
+      <div><label for="bill">Measure</label><input id="bill" name="bill" value="{{ filters.bill or '' }}" placeholder="SB1501 or HJR11"></div>
       <div class="form-actions"><button type="submit">Apply filters</button><a class="button-link" href="{{ url_for('retry_failures') }}">Clear</a></div>
     </form>
   </section>
@@ -38,7 +38,7 @@
         {% if filters.bill %}<input type="hidden" name="bill" value="{{ filters.bill }}">{% endif %}
         <input type="hidden" name="page" value="{{ pagination.page }}">
         <div class="table-scroll"><table>
-          <thead><tr><th class="check-column"><span class="visually-hidden">Select</span></th><th>Session / Bill</th><th>Document</th><th>Status</th><th>Attempts</th><th>Last error</th><th>Last attempt</th></tr></thead>
+          <thead><tr><th class="check-column"><span class="visually-hidden">Select</span></th><th>Session / Measure</th><th>Document</th><th>Status</th><th>Attempts</th><th>Last error</th><th>Last attempt</th></tr></thead>
           <tbody>{% for row in rows %}<tr>
             <td><input type="checkbox" name="document_ids" value="{{ row.id }}" aria-label="Select document {{ row.id }}" {% if row.download_status != 'failed_terminal' %}checked{% endif %}></td>
             <td>{{ row.session_key }}<div>{{ row.bill_id_display or row.bill_id_compact }}</div></td>

@@ -31,6 +31,7 @@ from .downloads import (
 )
 from .file_types import validate_file
 from .historical_collection import HistoricalCollectionService, HistoricalRunControl
+from .historical_sources import SessionScope, require_supported_session_key
 from .odata import (
     ODataClient,
     odata_datetime_literal,
@@ -53,7 +54,11 @@ from .source_mapping import (
     normalize_bill_id,
     normalize_session_key,
 )
-from .storage import MATCHING_RETRY_DOWNLOAD_STATUSES, StorageService
+from .storage import (
+    MATCHING_RETRY_DOWNLOAD_STATUSES,
+    RETRY_PAYLOAD_DOCUMENT_KINDS,
+    StorageService,
+)
 from .testimony_parser import ParsedTestimonyDocument, parse_testimony_page
 
 
@@ -84,6 +89,10 @@ class _DownloadFinalizationError(RuntimeError):
 
 class SourceRecordNotFound(RuntimeError):
     pass
+
+
+class SourceRecordMismatch(RuntimeError):
+    """The source returned a different measure than the requested identity."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -174,7 +183,7 @@ class CollectionService:
     # -- durable run creation ------------------------------------------------
 
     def create_collect_bill_run(self, session_key: str, bill_id: str) -> int:
-        session = normalize_session_key(session_key)
+        session = require_supported_session_key(session_key)
         _, _, compact, _ = normalize_bill_id(bill_id)
         return self.runs.create_run(
             "collect_bill",
@@ -186,7 +195,7 @@ class CollectionService:
         )
 
     def create_collect_session_run(self, session_key: str, *, max_bills: int | None = None) -> int:
-        session = normalize_session_key(session_key)
+        session = require_supported_session_key(session_key)
         if max_bills is not None and not 1 <= int(max_bills) <= 10_000:
             raise ValueError("max_bills must be between 1 and 10000")
         return self.runs.create_run(
@@ -205,6 +214,9 @@ class CollectionService:
                 "Historical archive retries must use Download Archive with its "
                 "frozen session scope and retryable-failures-only filter."
             )
+        source_session = source.get("requested_session_key")
+        if source_session:
+            require_supported_session_key(str(source_session))
         retryable = self.storage.list_documents_for_retry(
             run_id=source_run_id,
             include_terminal=True,
@@ -220,6 +232,46 @@ class CollectionService:
         )
         return run_id
 
+    def create_retry_selected_run(
+        self,
+        document_ids: Iterable[int],
+        *,
+        source_run_id: int | None = None,
+    ) -> int:
+        """Validate and freeze an explicit retry selection in the core service."""
+
+        ids = list(dict.fromkeys(int(value) for value in document_ids))
+        if not ids:
+            raise ValueError("Select at least one document to retry")
+        documents: list[dict[str, Any]] = []
+        for document_id in ids:
+            document = self.storage.get_document(document_id)
+            if document is None:
+                raise ValueError(f"Document {document_id} no longer exists")
+            require_supported_session_key(str(document.get("session_key") or ""))
+            if (
+                str(document.get("download_status"))
+                not in MATCHING_RETRY_DOWNLOAD_STATUSES
+                or str(document.get("document_kind"))
+                not in RETRY_PAYLOAD_DOCUMENT_KINDS
+                or not str(document.get("canonical_download_url") or "").strip()
+            ):
+                raise ValueError(
+                    f"Document {document_id} is no longer eligible for retry"
+                )
+            documents.append(document)
+
+        sessions = {str(document["session_key"]) for document in documents}
+        bills = {str(document["bill_id_compact"]) for document in documents}
+        return self.runs.create_run(
+            "retry_failures",
+            session_key=next(iter(sessions)) if len(sessions) == 1 else None,
+            bill_id_compact=next(iter(bills)) if len(bills) == 1 else None,
+            scope={"source_run_id": source_run_id, "document_ids": ids},
+            config_snapshot=self.config.snapshot(),
+            bills_total=0,
+        )
+
     def create_retry_matching_run(
         self,
         *,
@@ -229,7 +281,11 @@ class CollectionService:
     ) -> tuple[int, int]:
         """Freeze every filtered retry candidate without a JSON ID list."""
 
-        session = session_key.strip().upper() if session_key else None
+        session = require_supported_session_key(session_key) if session_key else None
+        if source_run_id is not None:
+            source = self.runs.get_run(source_run_id)
+            if source and source.get("requested_session_key"):
+                require_supported_session_key(str(source["requested_session_key"]))
         bill = (
             bill_id_compact.replace(" ", "").strip().upper()
             if bill_id_compact
@@ -292,11 +348,13 @@ class CollectionService:
         *,
         probe_remote_sizes: bool = False,
         force_full: bool = False,
+        resolved_scope: SessionScope | None = None,
     ) -> int:
         return self.historical.create_inventory_backfill_run(
             session_keys,
             probe_remote_sizes=probe_remote_sizes,
             force_full=force_full,
+            resolved_scope=resolved_scope,
         )
 
     def download_archive_preflight(
@@ -344,6 +402,7 @@ class CollectionService:
             return str(run["status"])
         try:
             scope = _json_object(run.get("requested_scope_json"))
+            self._validate_frozen_run_scope(run, scope)
             if run["run_type"] == "collect_bill":
                 result = self.collect_bill(
                     run_id,
@@ -417,8 +476,52 @@ class CollectionService:
             LOGGER.exception("Collection run %s failed", run_id)
             return "failed"
 
+    def requeue_run(self, run_id: int) -> bool:
+        """Validate a durable scope before making a paused run runnable again."""
+
+        run = self.runs.get_run(run_id)
+        if run is None:
+            return False
+        scope = _json_object(run.get("requested_scope_json"))
+        self._validate_frozen_run_scope(run, scope)
+        return self.runs.requeue(run_id)
+
+    def _validate_frozen_run_scope(
+        self,
+        run: Mapping[str, Any],
+        scope: Mapping[str, Any],
+    ) -> None:
+        """Fail closed on legacy durable rows before source or payload work."""
+
+        run_type = str(run.get("run_type") or "")
+        requested_session = str(run.get("requested_session_key") or "").strip()
+        if requested_session:
+            require_supported_session_key(requested_session)
+        if run_type in {"inventory_backfill", "download_archive"}:
+            for session_key in scope.get("session_keys", ()):
+                require_supported_session_key(str(session_key))
+        if run_type != "retry_failures":
+            return
+        for document_id in scope.get("document_ids", ()):
+            document = self.storage.get_document(int(document_id))
+            if document is None:
+                raise ValueError(f"Document {document_id} no longer exists")
+            require_supported_session_key(str(document.get("session_key") or ""))
+        with self.database.connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT DISTINCT d.session_key
+                FROM collection_run_items i
+                JOIN documents d ON d.id=i.document_id
+                WHERE i.run_id=? AND i.item_type='document'
+                """,
+                (int(run["id"]),),
+            ).fetchall()
+        for row in rows:
+            require_supported_session_key(str(row["session_key"]))
+
     def collect_session(self, run_id: int, session_key: str, *, max_bills: int | None = None) -> dict[str, Any]:
-        session_key = normalize_session_key(session_key)
+        session_key = require_supported_session_key(session_key)
         self._check_canceled(run_id)
         item_id = self._load_session_record(
             run_id,
@@ -426,7 +529,12 @@ class CollectionService:
             item_key=f"{session_key}:load_session",
         )
         measures = self.odata.get_measures(session_key, max_bills=int(max_bills) if max_bills else None)
-        self.runs.update_progress(run_id, item_id, len(measures), f"Found {len(measures)} House/Senate bills")
+        self.runs.update_progress(
+            run_id,
+            item_id,
+            len(measures),
+            f"Found {len(measures)} supported legislative measures",
+        )
         self.runs.set_counters(run_id, bills_total=len(measures))
         reference_data = self._load_reference_data(
             run_id,
@@ -499,7 +607,7 @@ class CollectionService:
         known_measure: Mapping[str, Any] | None = None,
         reference_data: SessionReferenceData | None = None,
     ) -> BillCollectionResult:
-        session_key = normalize_session_key(session_key)
+        session_key = require_supported_session_key(session_key)
         prefix, number, compact, _ = normalize_bill_id(bill_id)
         stage_key = lambda stage: f"{compact}:{stage}"  # noqa: E731
 
@@ -534,6 +642,15 @@ class CollectionService:
         if not raw_measure:
             raise SourceRecordNotFound(f"OData measure {session_key}/{compact} was not found")
         measure = map_measure(raw_measure)
+        returned_session = normalize_session_key(str(measure["session_key"]))
+        returned_compact = str(measure["bill_id_compact"])
+        if returned_session != session_key or returned_compact != compact:
+            raise SourceRecordMismatch(
+                "OData returned measure "
+                f"{returned_session}/{returned_compact} for requested "
+                f"{session_key}/{compact}"
+            )
+        measure["session_key"] = returned_session
         measure["current_committee_name"] = committee_names.get(measure.get("current_committee_code") or "")
         measure["enacted"] = int(bool(measure.get("chapter_number")))
         bill_pk = self.storage.upsert_bill(measure, run_id=run_id)
@@ -785,6 +902,11 @@ class CollectionService:
 
     def retry_failures(self, run_id: int, document_ids: Iterable[int]) -> dict[str, Any]:
         ids = list(dict.fromkeys(int(value) for value in document_ids))
+        for document_id in ids:
+            document = self.storage.get_document(document_id)
+            if document is None:
+                raise ValueError(f"Document {document_id} no longer exists")
+            require_supported_session_key(str(document.get("session_key") or ""))
         run = self.runs.get_run(run_id)
         item = self.runs.begin_stage(
             run_id,
@@ -833,6 +955,7 @@ class CollectionService:
                 document = self.storage.claim_next_retry_document(run_id)
                 if document is None:
                     return
+                require_supported_session_key(str(document.get("session_key") or ""))
                 _document_id, _outcome, byte_count = self._download_claimed_document(
                     run_id, document
                 )

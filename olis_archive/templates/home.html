@@ -18,19 +18,19 @@
           <div><p class="module-kicker">OLIS and Open Data</p><h3>Legislative Collection</h3></div>
           <a class="module-help-link" href="{{ url_for('help_page') }}#collecting">Guide</a>
         </div>
-        <p class="module-intro">Start durable, resumable collection work for an explicitly selected Oregon legislative bill or session.</p>
+        <p class="module-intro">Start durable, resumable collection work for an explicitly selected Oregon legislative measure or session.</p>
         <div class="module-list">
           <div class="module-row">
             <a class="module-button" href="{{ url_for('inventory_backfill') }}">Inventory Backfill</a>
-            <div class="description">Resolve every official session at or after 2014R1, catalog HB/SB records, and reconcile document discovery without downloading payloads.</div>
+            <div class="description">Scan the official session catalogue, choose an inclusive supported date range, and inventory every bill, resolution, and memorial without downloading payloads.</div>
           </div>
           <div class="module-row">
             <a class="module-button" href="{{ url_for('download_archive') }}">Download Archive</a>
             <div class="description">Preview a frozen inventoried scope, disk protection, and known-size lower bound before explicitly starting downloads.</div>
           </div>
           <div class="module-row">
-            <a class="module-button" href="{{ url_for('collect_bill') }}">Collect a Bill</a>
-            <div class="description">Retrieve one HB or SB, its sponsors and committee context, then archive every discovered in-scope document.</div>
+            <a class="module-button" href="{{ url_for('collect_bill') }}">Collect a Measure</a>
+            <div class="description">Retrieve one bill, resolution, or memorial with its sponsors and committee context, then archive every discovered in-scope document.</div>
           </div>
           <div class="module-row">
             <a class="module-button" href="{{ url_for('collect_session') }}">Collect a Session</a>
@@ -48,7 +48,7 @@
         <div class="module-list">
           <div class="module-row">
             <a class="module-button" href="{{ url_for('runs') }}">Run History</a>
-            <div class="description">Inspect current and completed bill/session collections, counters, stages, and durable error records.</div>
+            <div class="description">Inspect current and completed measure/session collections, counters, stages, and durable error records.</div>
           </div>
           <div class="module-row">
             <a class="module-button" href="{{ url_for('retry_failures') }}">Retry Failures</a>
@@ -68,15 +68,15 @@
           <div><p class="module-kicker">Local SQLite archive</p><h3>Browse Archive</h3></div>
           <a class="module-help-link" href="{{ url_for('help_page') }}#archive">Guide</a>
         </div>
-        <p class="module-intro">Explore normalized bill metadata and document provenance without issuing another source request.</p>
+        <p class="module-intro">Explore normalized measure metadata and document provenance without issuing another source request.</p>
         <div class="module-list">
           <div class="module-row">
             <a class="module-button" href="{{ url_for('session_status') }}">Session Status</a>
-            <div class="description">Compare HB/SB totals, document kinds, completeness, failures, probed size, and archive activity by session.</div>
+            <div class="description">Compare House/Senate measure totals, document kinds, completeness, failures, probed size, and archive activity by session.</div>
           </div>
           <div class="module-row">
-            <a class="module-button" href="{{ url_for('bills') }}">Browse Bills</a>
-            <div class="description">Filter collected House and Senate bills by session, chamber, identifier, or enactment.</div>
+            <a class="module-button" href="{{ url_for('bills') }}">Browse Measures</a>
+            <div class="description">Filter collected bills, resolutions, and memorials by session, originating chamber, identifier, or enactment.</div>
           </div>
           <div class="module-row">
             <a class="module-button" href="{{ url_for('documents') }}">Browse Documents</a>
@@ -110,7 +110,7 @@
     <div class="stat-grid stat-grid-eight" aria-label="Archive status">
       <div class="stat"><span class="stat-label">Sessions in scope</span><strong>{{ stats.sessions or 0 }}</strong></div>
       <div class="stat"><span class="stat-label">Sessions inventory complete</span><strong>{{ stats.sessions_complete or 0 }}</strong></div>
-      <div class="stat"><span class="stat-label">Bills cataloged</span><strong>{{ stats.bills or 0 }}</strong></div>
+      <div class="stat"><span class="stat-label">Measures cataloged</span><strong>{{ stats.bills or 0 }}</strong></div>
       <div class="stat"><span class="stat-label">Documents discovered</span><strong>{{ stats.documents_discovered or 0 }}</strong></div>
       <div class="stat"><span class="stat-label">Public testimony</span><strong>{{ stats.public_testimony or 0 }}</strong></div>
       <div class="stat"><span class="stat-label">Presentation / legacy</span><strong>{{ stats.presentation_legacy or 0 }}</strong></div>
@@ -148,7 +148,7 @@
         </table>
       </div>
     {% else %}
-      <div class="empty-state"><strong>No collection runs yet.</strong><p>Begin with <a href="{{ url_for('inventory_backfill') }}">Inventory Backfill</a> or a targeted <a href="{{ url_for('collect_bill') }}">bill collection</a>.</p></div>
+      <div class="empty-state"><strong>No collection runs yet.</strong><p>Begin with <a href="{{ url_for('inventory_backfill') }}">Inventory Backfill</a> or a targeted <a href="{{ url_for('collect_bill') }}">measure collection</a>.</p></div>
     {% endif %}
   </section>
 {% endblock %}

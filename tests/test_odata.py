@@ -1,7 +1,7 @@
 import http.client
 import json
 from urllib.error import HTTPError
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 
@@ -12,6 +12,7 @@ from olis_archive.services.odata import (
     odata_datetime_literal,
     parse_retry_after,
 )
+from olis_archive.services.source_mapping import SUPPORTED_MEASURE_PREFIXES
 
 
 class FakeResponse:
@@ -76,6 +77,33 @@ def test_odata_follows_relative_v3_continuation(fixture_dir):
     assert [row["MeasureNumber"] for row in rows] == [2001, 1501]
     assert len(requested) == 2
     assert urlsplit(requested[1]).hostname == "api.oregonlegislature.gov"
+
+
+def test_get_measures_requests_every_supported_legislative_prefix():
+    requested = []
+
+    def transport(url, headers, timeout):
+        requested.append(url)
+        return 200, {"Content-Type": "application/json"}, b'{"value": []}', url
+
+    client = ODataClient(transport=transport, inter_request_delay=0)
+
+    assert client.get_measures("2025R1") == []
+
+    source_filter = parse_qs(urlsplit(requested[0]).query)["$filter"][0]
+    assert "SessionKey eq '2025R1'" in source_filter
+    for prefix in SUPPORTED_MEASURE_PREFIXES:
+        assert source_filter.count(f"MeasurePrefix eq '{prefix}'") == 1
+
+
+def test_targeted_measure_query_rejects_an_unknown_prefix_before_network_access():
+    client = ODataClient(
+        transport=lambda *_args: pytest.fail("unexpected network request"),
+        inter_request_delay=0,
+    )
+
+    with pytest.raises(ValueError, match="Unsupported measure prefix"):
+        client.get_measure("2025R1", "ZZ", 1)
 
 
 def test_odata_rejects_cross_host_continuation():

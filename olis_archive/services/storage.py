@@ -18,6 +18,12 @@ from typing import Any, Iterable, Mapping, Sequence
 from uuid import uuid4
 
 from ..database import Database
+from .source_mapping import (
+    chamber_for_prefix,
+    measure_type_for_prefix,
+    normalize_bill_id,
+    normalize_measure_prefix,
+)
 
 
 RUN_STATUSES = frozenset(
@@ -445,17 +451,42 @@ class StorageService:
             },
         )
         session_key = _required_text(source, "session_key").upper()
-        prefix = _required_text(source, "measure_prefix").upper()
-        if prefix not in {"HB", "SB"}:
-            raise ValueError("only HB and SB measures are supported")
-        number = _required_text(source, "measure_number")
-        compact = str(source.get("bill_id_compact") or f"{prefix}{number}").replace(" ", "").upper()
-        display = str(source.get("bill_id_display") or f"{prefix} {number}").strip().upper()
-        chamber = str(source.get("bill_chamber") or ("House" if prefix == "HB" else "Senate"))
+        prefix = normalize_measure_prefix(_required_text(source, "measure_prefix"))
+        supplied_number = _required_text(source, "measure_number")
+        _, canonical_number, compact, display = normalize_bill_id(
+            f"{prefix}{supplied_number}"
+        )
+        number = str(canonical_number)
+        for identity_field in ("bill_id_compact", "bill_id_display"):
+            supplied_identity = source.get(identity_field)
+            if supplied_identity is None:
+                continue
+            supplied_prefix, supplied_identity_number, _, _ = normalize_bill_id(
+                str(supplied_identity)
+            )
+            if (supplied_prefix, supplied_identity_number) != (
+                prefix,
+                canonical_number,
+            ):
+                raise ValueError(
+                    f"{identity_field} does not match measure_prefix/measure_number"
+                )
+        expected_chamber = chamber_for_prefix(prefix)
+        chamber = str(source.get("bill_chamber") or expected_chamber).strip()
+        if chamber != expected_chamber:
+            raise ValueError(
+                f"{prefix} originates in the {expected_chamber}, not {chamber or 'an unknown chamber'}"
+            )
+        expected_measure_type = measure_type_for_prefix(prefix)
+        measure_type = str(source.get("measure_type") or expected_measure_type).strip()
+        if measure_type != expected_measure_type:
+            raise ValueError(
+                f"{prefix} has measure type {expected_measure_type!r}, not {measure_type!r}"
+            )
         timestamp = _utc_timestamp(seen_at)
         allowed = {
             "session_key", "measure_id", "measure_prefix", "measure_number", "bill_id_compact",
-            "bill_id_display", "bill_chamber", "at_the_request_of", "title_source_field", "bill_title",
+            "bill_id_display", "bill_chamber", "measure_type", "at_the_request_of", "title_source_field", "bill_title",
             "catchline", "measure_summary", "chapter_number", "effective_date", "vetoed",
             "emergency_clause", "current_version", "current_location", "current_committee_code",
             "current_subcommittee_code", "current_committee_name", "relating_to", "relating_to_clause",
@@ -470,6 +501,7 @@ class StorageService:
             bill_id_compact=compact,
             bill_id_display=display,
             bill_chamber=chamber,
+            measure_type=measure_type,
             first_collected_at=timestamp,
             last_seen_at=timestamp,
             last_synced_at=timestamp,
@@ -2503,6 +2535,9 @@ class StorageService:
         status_marks = ",".join("?" for _ in statuses)
         kind_marks = ",".join("?" for _ in RETRY_PAYLOAD_DOCUMENT_KINDS)
         where = [
+            # Documents have normalized session keys. Keep legacy rows out of
+            # an unfiltered retry snapshot even when no UI/CLI filter is given.
+            "CAST(substr(d.session_key,1,4) AS INTEGER) >= 2014",
             f"d.download_status IN ({status_marks})",
             f"d.document_kind IN ({kind_marks})",
             "NULLIF(trim(d.canonical_download_url),'') IS NOT NULL",

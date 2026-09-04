@@ -35,7 +35,7 @@
       <h3>Source Metadata</h3>
       <table class="key-table"><tbody>
         <tr><th>Session</th><td>{{ document.session_key }}</td></tr>
-        <tr><th>Bill</th><td>{{ document.bill_id_display or document.bill_id_compact or '—' }}</td></tr>
+        <tr><th>Measure</th><td>{{ document.bill_id_display or document.bill_id_compact or '—' }}</td></tr>
         <tr><th>Kind</th><td>{{ (document.document_kind or 'unknown')|replace('_', ' ')|title }}</td></tr>
         <tr><th>Source section</th><td>{{ (document.source_section or '—')|replace('_', ' ') }}</td></tr>
         <tr><th>Source entity</th><td>{{ document.source_entity_type or '—' }}</td></tr>

@@ -1,12 +1,12 @@
 {% extends "base.html" %}
 
-{% block title %}Collect a Bill - LegiView{% endblock %}
+{% block title %}Collect a Measure - LegiView{% endblock %}
 
 {% block content %}
   <section class="page-heading">
     <div>
       <p class="eyebrow">Legislative Collection</p>
-      <h2>Collect a Bill</h2>
+      <h2>Collect a Measure</h2>
       <p class="heading-summary">Queue one durable collection run using the same service used by the command line.</p>
     </div>
     <a class="button-link" href="{{ url_for('runs') }}">Run history</a>
@@ -24,16 +24,16 @@
             <option value="{{ session_value }}">{{ session.session_name or session.name or session_value }}</option>
           {% endfor %}
         </datalist>
-        <p class="field-note">Use the official key, such as <code>2026R1</code>.</p>
+        <p class="field-note">Use an official key at or after the validated <code>2014R1</code> boundary, such as <code>2026R1</code>.</p>
       </div>
       <div>
-        <label for="bill_id">Bill</label>
-        <input id="bill_id" name="bill_id" value="{{ bill_id or '' }}" placeholder="SB1501 or SB 1501" autocomplete="off" pattern="[HhSs][Bb]\s*[0-9]+" required>
-        <p class="field-note">Targeted collection accepts House Bills and Senate Bills only.</p>
+        <label for="bill_id">Measure</label>
+        <input id="bill_id" name="bill_id" value="{{ bill_id or '' }}" placeholder="SB1501, HJR11, or HCR 2" autocomplete="off" required>
+        <p class="field-note">Accepted prefixes: HB, SB, HJR, SJR, HCR, SCR, HR, SR, HJM, SJM, HM, and SM.</p>
       </div>
       <div class="form-actions full">
-        <button type="submit">Queue bill collection</button>
-        <a class="button-link" href="{{ url_for('bills') }}">Browse existing bills</a>
+        <button type="submit">Queue measure collection</button>
+        <a class="button-link" href="{{ url_for('bills') }}">Browse existing measures</a>
       </div>
     </form>
   </section>
@@ -41,7 +41,7 @@
   <section class="guidance-card collection-guidance">
     <h3>What this run collects</h3>
     <ol class="workflow-steps">
-      <li><div><strong>Official bill metadata and references</strong><p>Session, measure, sponsors, legislators, committees, meetings, and agenda context come from filtered OData queries.</p></div></li>
+      <li><div><strong>Official measure metadata and references</strong><p>Session, measure, sponsors, legislators, committees, meetings, and agenda context come from filtered OData queries.</p></div></li>
       <li><div><strong>Document discovery and normalization</strong><p>LegiView reconciles modern testimony HTML with OData and preserves historical presentation classifications.</p></div></li>
       <li><div><strong>Validated file retention</strong><p>Downloads stream through <code>.part</code> files, are hashed, validated, and finalized without replacing a valid prior version.</p></div></li>
     </ol>
@@ -49,7 +49,7 @@
 
   {% if recent_runs %}
     <section class="content-section">
-      <div class="section-heading-row"><h2>Recent Bill Runs</h2><a class="text-link" href="{{ url_for('runs') }}">All runs</a></div>
+      <div class="section-heading-row"><h2>Recent Measure Runs</h2><a class="text-link" href="{{ url_for('runs') }}">All runs</a></div>
       <div class="table-scroll"><table>
         <thead><tr><th>Run</th><th>Scope</th><th>Status</th><th>Stage</th><th>Downloaded</th><th>Started</th></tr></thead>
         <tbody>{% for run in recent_runs %}<tr>

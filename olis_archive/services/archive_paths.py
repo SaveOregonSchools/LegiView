@@ -50,7 +50,7 @@ def validate_archive_root_candidate(archive_root: str | Path) -> Path:
 
     An existing root is accepted only when it has LegiView's ownership marker,
     is empty, or is an unmistakable marker-less archive using the legacy
-    session/bill/kind/source-ID hierarchy.  This prevents a broad directory
+    session/measure/kind/source-ID hierarchy.  This prevents a broad directory
     such as Documents from becoming the target of recursive startup cleanup.
     """
 

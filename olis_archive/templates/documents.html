@@ -15,7 +15,7 @@
   <section class="tool-surface accent-browse">
     <form method="get" action="{{ url_for('documents') }}" class="filter-form document-filter-form">
       <div><label for="session">Session</label><select id="session" name="session"><option value="">All sessions</option>{% for session in session_options %}{% set value = session.session_key or session.key or session %}<option value="{{ value }}" {% if filters.session == value %}selected{% endif %}>{{ session.session_name or session.name or value }}</option>{% endfor %}</select></div>
-      <div><label for="bill">Bill</label><input id="bill" name="bill" value="{{ filters.bill or '' }}" placeholder="HB4111"></div>
+      <div><label for="bill">Measure</label><input id="bill" name="bill" value="{{ filters.bill or '' }}" placeholder="HB4111 or HJR11"></div>
       <div><label for="kind">Document kind</label><select id="kind" name="kind"><option value="">All kinds</option>{% for kind in document_kinds %}<option value="{{ kind.value or kind }}" {% if filters.kind == (kind.value or kind) %}selected{% endif %}>{{ kind.label or (kind.value or kind)|replace('_', ' ')|title }}</option>{% endfor %}</select></div>
       <div><label for="committee">Committee</label><input id="committee" name="committee" value="{{ filters.committee or '' }}" placeholder="Rules or SRULES"></div>
       <div><label for="submitter">Submitter</label><input id="submitter" name="submitter" value="{{ filters.submitter or '' }}"></div>
@@ -33,7 +33,7 @@
     <div class="section-heading-row"><h2>Documents</h2><span class="status-note">{{ pagination.total or rows|length or 0 }} result{% if (pagination.total or rows|length or 0) != 1 %}s{% endif %}</span></div>
     {% if rows %}
       <div class="table-scroll"><table>
-        <thead><tr><th>Session / Bill</th><th>Kind</th><th>Title</th><th>Submitter</th><th>Committee / Date</th><th>Position</th><th>Presence / OLIS</th><th>Download</th><th>Bytes</th></tr></thead>
+        <thead><tr><th>Session / Measure</th><th>Kind</th><th>Title</th><th>Submitter</th><th>Committee / Date</th><th>Position</th><th>Presence / OLIS</th><th>Download</th><th>Bytes</th></tr></thead>
         <tbody>{% for row in rows %}<tr>
           <td>{{ row.session_key }}<div><a href="{{ url_for('bill_detail', bill_id=row.bill_pk or row.bill_id) }}">{{ row.bill_id_display or row.bill_id_compact }}</a></div></td>
           <td>{{ (row.document_kind or 'unknown')|replace('_', ' ')|title }}</td>
@@ -53,7 +53,7 @@
         {% if pagination.next_url %}<a class="button-link" href="{{ pagination.next_url }}">Next</a>{% endif %}
       </nav>
     {% else %}
-      <div class="empty-state"><strong>No documents match these filters.</strong><p>Clear the filters or collect another bill.</p></div>
+      <div class="empty-state"><strong>No documents match these filters.</strong><p>Clear the filters or collect another measure.</p></div>
     {% endif %}
   </section>
 {% endblock %}

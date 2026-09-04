@@ -24,11 +24,11 @@
     <div class="section-heading-row"><h2>Sessions</h2><span class="status-note">{{ pagination.total or 0 }} result{% if (pagination.total or 0) != 1 %}s{% endif %}</span></div>
     {% if rows %}
       <div class="table-scroll"><table class="wide-table">
-        <thead><tr><th>Session</th><th>Dates</th><th>HB / SB</th><th>Inventory</th><th>Testimony</th><th>Presentation / legacy</th><th>Floor letters</th><th>Documents</th><th>Downloadable / downloaded</th><th>Failures</th><th>Unknown / anomalies</th><th>Remote size coverage</th><th>Known remote bytes</th><th>Local archive</th><th>Last inventory</th><th>Last download</th><th>Drill-down</th></tr></thead>
+        <thead><tr><th>Session</th><th>Dates</th><th>House / Senate measures</th><th>Inventory</th><th>Testimony</th><th>Presentation / legacy</th><th>Floor letters</th><th>Documents</th><th>Downloadable / downloaded</th><th>Failures</th><th>Unknown / anomalies</th><th>Remote size coverage</th><th>Known remote bytes</th><th>Local archive</th><th>Last inventory</th><th>Last download</th><th>Drill-down</th></tr></thead>
         <tbody>{% for row in rows %}<tr>
           <td><strong>{{ row.session_key }}</strong><div class="table-note">{{ row.session_name or '—' }}</div></td>
           <td>{{ row.begin_date or '—' }}<div class="table-note">{{ row.end_date or 'Open / unknown' }}</div></td>
-          <td><a href="{{ url_for('bills', session=row.session_key, chamber='House') }}">{{ row.hb_count }}</a> / <a href="{{ url_for('bills', session=row.session_key, chamber='Senate') }}">{{ row.sb_count }}</a></td>
+          <td><a href="{{ url_for('bills', session=row.session_key, chamber='House') }}">{{ row.house_measure_count }}</a> / <a href="{{ url_for('bills', session=row.session_key, chamber='Senate') }}">{{ row.senate_measure_count }}</a><div class="table-note">Bills only: {{ row.hb_count }} HB / {{ row.sb_count }} SB</div></td>
           <td><span class="status {{ row.inventory_status }}">{{ row.inventory_status|replace('_', ' ') }}</span></td>
           <td><a href="{{ url_for('documents', session=row.session_key, kind='public_testimony') }}">{{ row.public_testimony_count }}</a></td>
           <td>{{ row.presentation_legacy_count }}<div class="table-note"><a href="{{ url_for('documents', session=row.session_key, kind='committee_presentation') }}">Presentations</a> · <a href="{{ url_for('documents', session=row.session_key, kind='legacy_testimony') }}">Legacy</a></div></td>
@@ -42,7 +42,7 @@
           <td>{{ row.local_archive_bytes|human_bytes }}</td>
           <td>{{ row.last_successful_inventory_at or '—' }}{% if row.last_successful_inventory_run_id %}<div><a href="{{ url_for('run_detail', run_id=row.last_successful_inventory_run_id) }}">Run #{{ row.last_successful_inventory_run_id }}</a></div>{% endif %}</td>
           <td>{{ row.last_download_activity_at or '—' }}{% if row.last_download_run_id %}<div><a href="{{ url_for('run_detail', run_id=row.last_download_run_id) }}">Run #{{ row.last_download_run_id }}</a></div>{% endif %}</td>
-          <td><a href="{{ url_for('bills', session=row.session_key) }}">Bills</a> · <a href="{{ url_for('documents', session=row.session_key) }}">Documents</a> · <a href="{{ url_for('runs', scope=row.session_key) }}">Runs</a></td>
+          <td><a href="{{ url_for('bills', session=row.session_key) }}">Measures</a> · <a href="{{ url_for('documents', session=row.session_key) }}">Documents</a> · <a href="{{ url_for('runs', scope=row.session_key) }}">Runs</a></td>
         </tr>{% endfor %}</tbody>
       </table></div>
       <nav class="pagination" aria-label="Session result pages">{% if pagination.prev_url %}<a class="button-link" href="{{ pagination.prev_url }}">Previous</a>{% endif %}<span>Page {{ pagination.page }}{% if pagination.pages %} of {{ pagination.pages }}{% endif %}</span>{% if pagination.next_url %}<a class="button-link" href="{{ pagination.next_url }}">Next</a>{% endif %}</nav>

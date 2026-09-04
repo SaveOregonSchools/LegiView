@@ -5,6 +5,7 @@ import sqlite3
 import pytest
 
 from olis_archive.database import Database, MigrationError
+from olis_archive.services.source_mapping import normalize_bill_id
 from olis_archive.services.storage import StorageService
 
 
@@ -21,16 +22,14 @@ def seed_bill(storage: StorageService, *, session: str = "2026R1", bill: str = "
     storage.upsert_session(
         {"session_key": session, "session_name": "2026 Regular Session"}, seen_at=T1
     )
-    prefix = bill[:2]
-    number = bill[2:]
+    prefix, number, compact, display = normalize_bill_id(bill)
     return storage.upsert_bill(
         {
             "session_key": session,
             "measure_prefix": prefix,
             "measure_number": number,
-            "bill_id_compact": bill,
-            "bill_id_display": f"{prefix} {number}",
-            "bill_chamber": "Senate" if prefix == "SB" else "House",
+            "bill_id_compact": compact,
+            "bill_id_display": display,
             "bill_title": "Relating to a test measure.",
             "raw_json": {"MeasurePrefix": prefix, "MeasureNumber": int(number)},
         },
@@ -42,9 +41,9 @@ def test_migrations_enable_wal_foreign_keys_and_expected_tables(tmp_path):
     path = tmp_path / "state" / "legiview.sqlite3"
     database = Database(path)
 
-    assert database.initialize() == 5
+    assert database.initialize() == 6
     # A second startup is an idempotent migration no-op.
-    assert database.initialize() == 5
+    assert database.initialize() == 6
 
     expected = {
         "schema_migrations",
@@ -80,10 +79,10 @@ def test_migrations_enable_wal_foreign_keys_and_expected_tables(tmp_path):
             connection.execute(
                 """
                 INSERT INTO bills(
-                    session_key, measure_prefix, measure_number, bill_id_compact,
+                    session_key, measure_prefix, measure_type, measure_number, bill_id_compact,
                     bill_id_display, bill_chamber, first_collected_at, last_seen_at,
                     last_synced_at
-                ) VALUES ('MISSING', 'SB', '1', 'SB1', 'SB 1', 'Senate', ?, ?, ?)
+                ) VALUES ('MISSING', 'SB', 'bill', '1', 'SB1', 'SB 1', 'Senate', ?, ?, ?)
                 """,
                 (T1, T1, T1),
             )
@@ -101,13 +100,13 @@ def test_migration_manifest_rejects_drift_gaps_and_future_schema(
     tmp_path, history_case, expected_error
 ):
     database = Database(tmp_path / f"{history_case}.sqlite3")
-    assert database.initialize() == 5
+    assert database.initialize() == 6
     assert database.migration_manifest_is_current()
 
     with database.transaction() as connection:
         if history_case == "checksum":
             connection.execute(
-                "UPDATE schema_migrations SET checksum=? WHERE version=5", ("0" * 64,)
+                "UPDATE schema_migrations SET checksum=? WHERE version=6", ("0" * 64,)
             )
         elif history_case == "gap":
             connection.execute("DELETE FROM schema_migrations WHERE version=4")

@@ -103,7 +103,7 @@ def test_app_factory_uses_isolated_paths_and_does_not_start_workers(web_app, tmp
     assert runtime.config.database_path == tmp_path / "data" / "legiview.sqlite3"
     assert runtime.config.archive_root == tmp_path / "archive"
     assert runtime.config.archive_root.is_dir()
-    assert runtime.database.schema_version() == 5
+    assert runtime.database.schema_version() == 6
     assert extension["workers"].snapshot() == {
         "workers": 0,
         "queued": 0,
@@ -115,9 +115,9 @@ def test_app_factory_uses_isolated_paths_and_does_not_start_workers(web_app, tmp
 def test_app_rejects_untrusted_host_headers(web_app):
     client = web_app.test_client()
 
-    assert client.get("/health", headers={"Host": "localhost:5000"}).status_code == 200
-    assert client.get("/health", headers={"Host": "127.0.0.1:5000"}).status_code == 200
-    assert client.get("/health", headers={"Host": "[::1]:5000"}).status_code == 200
+    assert client.get("/health", headers={"Host": "localhost:5055"}).status_code == 200
+    assert client.get("/health", headers={"Host": "127.0.0.1:5055"}).status_code == 200
+    assert client.get("/health", headers={"Host": "[::1]:5055"}).status_code == 200
     assert client.get("/health", headers={"Host": "attacker.example"}).status_code == 400
 
 
@@ -638,7 +638,45 @@ def test_cli_help_and_show_bill_use_the_shared_runtime(tmp_path: Path, monkeypat
     assert output["documents"][0]["source_id"] == "244133"
 
     assert cli.main(["show-bill", "2026r1", "hb 9999"]) == 1
-    assert "No stored bill found" in capsys.readouterr().err
+    assert "No stored measure found" in capsys.readouterr().err
+
+
+def test_cli_serve_passes_host_and_port_to_the_app_factory(monkeypatch):
+    from olis_archive import web as web_module
+
+    captured: dict[str, object] = {}
+
+    class FakeApp:
+        extensions = {
+            "legiview": {
+                "runtime": SimpleNamespace(
+                    config=SimpleNamespace(host="localhost", port=5099, debug=False)
+                )
+            }
+        }
+
+        @staticmethod
+        def run(**values):
+            captured["run"] = values
+
+    def fake_create_app(overrides):
+        captured["overrides"] = overrides
+        return FakeApp()
+
+    monkeypatch.setattr(web_module, "create_app", fake_create_app)
+
+    assert cli.main(["serve", "--host", "localhost", "--port", "5099"]) == 0
+    assert captured["overrides"] == {
+        "START_WORKER": True,
+        "HOST": "localhost",
+        "PORT": 5099,
+    }
+    assert captured["run"] == {
+        "host": "localhost",
+        "port": 5099,
+        "debug": False,
+        "use_reloader": False,
+    }
 
 
 @pytest.mark.parametrize(
@@ -660,6 +698,68 @@ def test_cli_exit_status_distinguishes_clean_and_partial_runs(status, expected_e
 
     assert cli._execute_and_print(FakeCollection(), 42) == expected_exit
     assert json.loads(capsys.readouterr().out)["status"] == status
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    (
+        ["collect-measure", "2007R1", "HB2001"],
+        ["collect-session", "2007R1"],
+    ),
+)
+def test_direct_collection_cli_reports_boundary_rejection_without_traceback(
+    arguments, monkeypatch, capsys
+):
+    class FakeCollection:
+        @staticmethod
+        def create_collect_bill_run(*_args, **_kwargs):
+            raise ValueError(
+                "Session 2007R1 predates LegiView's validated support boundary 2014R1"
+            )
+
+        @staticmethod
+        def create_collect_session_run(*_args, **_kwargs):
+            raise ValueError(
+                "Session 2007R1 predates LegiView's validated support boundary 2014R1"
+            )
+
+    monkeypatch.setattr(
+        cli,
+        "build_runtime",
+        lambda *args, **kwargs: SimpleNamespace(collection=FakeCollection()),
+    )
+
+    assert cli.main(arguments) == 2
+    captured = capsys.readouterr()
+    assert "2007R1" in captured.err
+    assert "support boundary 2014R1" in captured.err
+    assert "Traceback" not in captured.err
+    assert captured.out == ""
+
+
+def test_resume_cli_reports_frozen_scope_rejection_without_requeue(
+    monkeypatch, capsys
+):
+    class FakeCollection:
+        @staticmethod
+        def requeue_run(run_id):
+            assert run_id == 73
+            raise ValueError(
+                "Session 2007R1 predates LegiView's validated support boundary 2014R1"
+            )
+
+    monkeypatch.setattr(
+        cli,
+        "build_runtime",
+        lambda *args, **kwargs: SimpleNamespace(collection=FakeCollection()),
+    )
+
+    assert cli.main(["resume-run", "73"]) == 2
+    captured = capsys.readouterr()
+    assert "Run #73 cannot be resumed" in captured.err
+    assert "support boundary 2014R1" in captured.err
+    assert "Traceback" not in captured.err
+    assert captured.out == ""
 
 
 def test_legacy_retry_snapshot_rejects_historical_bulk_runs(web_app):
@@ -921,7 +1021,7 @@ def test_exclusive_runtime_lock_blocks_a_second_mutator_but_allows_read_only(
             exclusive=False,
         )
         assert initialize_calls == []
-        assert reader.database.schema_version() == 5
+        assert reader.database.schema_version() == 6
 
         monkeypatch.setattr(
             Database, "migration_manifest_is_current", lambda _database: False
