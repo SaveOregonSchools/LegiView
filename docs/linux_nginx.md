@@ -20,7 +20,7 @@ cd /opt/legiview
 python3 -m venv .venv
 .venv/bin/pip install --upgrade pip
 .venv/bin/pip install -e '.[server]'
-sudo install -d -o legiview -g legiview /etc/legiview
+sudo install -d -o root -g legiview -m 0750 /etc/legiview
 sudo install -o root -g legiview -m 0640 deploy/legiview.env.example /etc/legiview/legiview.env
 sudo install -o root -g root -m 0644 deploy/legiview.service /etc/systemd/system/legiview.service
 ```
