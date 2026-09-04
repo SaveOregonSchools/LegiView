@@ -72,6 +72,10 @@ def test_old_and_new_document_classification(fixture_dir):
     assert other["document_kind"] == "committee_document_other"
     assert other["download_status"] == "not_applicable"
     assert classify_committee_document("future-type")[0] == "committee_document_other"
+    assert classify_committee_document("Written Testimony") == (
+        "committee_document_other",
+        "unrecognized_raw_document_type",
+    )
 
 
 def test_floor_letter_mapping(fixture_dir):

@@ -12,7 +12,8 @@
       <p class="heading-summary">{{ bill.bill_title or bill.relating_to or 'No bill title supplied by the source.' }}</p>
     </div>
     <div class="action-row">
-      {% if bill.source_url %}<a class="button-link" href="{{ bill.source_url }}" target="_blank" rel="noopener">Open in OLIS</a>{% endif %}
+      {% set bill_source_url = bill.source_url|official_source_url %}
+      {% if bill_source_url %}<a class="button-link" href="{{ bill_source_url }}" target="_blank" rel="noopener">Open in OLIS</a>{% endif %}
       <a class="button-link primary" href="{{ url_for('collect_bill') }}?session_key={{ bill.session_key }}&bill_id={{ bill.bill_id_compact }}">Collect again</a>
     </div>
   </section>
@@ -107,7 +108,7 @@
     ('unknown', 'Unclassified Documents')
   ] %}
   <section class="content-section">
-    <div class="section-heading-row"><h2>Documents</h2><a class="text-link" href="{{ url_for('documents') }}?session={{ bill.session_key }}&bill={{ bill.bill_id_compact }}">Open in document browser</a></div>
+    <div class="section-heading-row"><h2>Documents</h2><div class="action-row"><span class="status-note">{{ document_pagination.total or 0 }} total</span><a class="text-link" href="{{ url_for('documents') }}?session={{ bill.session_key }}&bill={{ bill.bill_id_compact }}">Open in document browser</a></div></div>
     <div class="document-groups">
       {% for key, label in sections %}
         {% set group_rows = groups.get(key, []) %}
@@ -122,7 +123,8 @@
                 <td>{{ document.meeting_date or document.letter_date or '—' }}<div class="table-note">{{ document.committee_name or document.committee_code or document.chamber or '' }}</div></td>
                 <td><span class="status {{ document.download_status }}">{{ (document.download_status or 'unknown')|replace('_', ' ') }}</span></td>
                 <td>{{ document.local_filename or document.remote_filename or '—' }}{% if document.downloaded_bytes or document.byte_count %}<div class="table-note">{{ (document.downloaded_bytes or document.byte_count)|human_bytes }}</div>{% endif %}</td>
-                <td>{% if document.local_action_url %}<a href="{{ document.local_action_url }}">Local file</a>{% endif %}{% if document.source_url %}{% if document.local_action_url %}<span aria-hidden="true"> · </span>{% endif %}<a href="{{ document.source_url }}" target="_blank" rel="noopener">OLIS</a>{% elif not document.local_action_url %}—{% endif %}</td>
+                {% set document_source_url = document.source_url|official_source_url %}
+                <td>{% if document.local_action_url %}<a href="{{ document.local_action_url }}">Local file</a>{% endif %}{% if document_source_url %}{% if document.local_action_url %}<span aria-hidden="true"> · </span>{% endif %}<a href="{{ document_source_url }}" target="_blank" rel="noopener">OLIS</a>{% elif not document.local_action_url %}—{% endif %}</td>
               </tr>{% endfor %}</tbody>
             </table></div>
           </section>
@@ -130,5 +132,6 @@
       {% endfor %}
       {% if not groups %}<div class="empty-state"><strong>No documents discovered.</strong><p>Run collection again to refresh this bill's source records.</p></div>{% endif %}
     </div>
+    {% if document_pagination.total %}<nav class="pagination" aria-label="Bill document pages">{% if document_pagination.prev_url %}<a class="button-link" href="{{ document_pagination.prev_url }}">Previous</a>{% endif %}<span>Page {{ document_pagination.page }}{% if document_pagination.pages %} of {{ document_pagination.pages }}{% endif %}</span>{% if document_pagination.next_url %}<a class="button-link" href="{{ document_pagination.next_url }}">Next</a>{% endif %}</nav>{% endif %}
   </section>
 {% endblock %}

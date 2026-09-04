@@ -14,6 +14,7 @@ from hashlib import sha256
 from pathlib import Path
 import re
 import sqlite3
+import threading
 from typing import Iterator, Sequence
 
 
@@ -53,6 +54,12 @@ class Database:
         self.path = raw_path
         self.migrations_path = Path(migrations_path or Path(__file__).with_name("migrations"))
         self.busy_timeout_ms = busy_timeout_ms
+        # Page-sized historical ingestion deliberately groups many existing
+        # StorageService calls into one transaction.  Those calls still use
+        # ``Database.transaction()`` themselves, so a thread-local unit of work
+        # lets nested calls join the bounded outer transaction without sharing
+        # connections across worker threads.
+        self._local = threading.local()
 
     @property
     def is_memory(self) -> bool:
@@ -80,6 +87,10 @@ class Database:
 
     @contextmanager
     def connection(self) -> Iterator[sqlite3.Connection]:
+        active = getattr(self._local, "transaction_connection", None)
+        if active is not None:
+            yield active
+            return
         connection = self.connect()
         try:
             yield connection
@@ -88,10 +99,22 @@ class Database:
 
     @contextmanager
     def transaction(self, *, immediate: bool = True) -> Iterator[sqlite3.Connection]:
-        """Yield a connection in an explicit commit-or-rollback transaction."""
+        """Yield an explicit transaction, joining a thread-local outer unit.
+
+        Joining is intentional rather than savepoint-based: the historical
+        collector wraps exactly one bounded source page, and all storage writes
+        for that page must either commit together or roll back together.  The
+        outermost context remains responsible for commit/rollback.
+        """
+
+        active = getattr(self._local, "transaction_connection", None)
+        if active is not None:
+            yield active
+            return
 
         with self.connection() as connection:
             connection.execute("BEGIN IMMEDIATE" if immediate else "BEGIN")
+            self._local.transaction_connection = connection
             try:
                 yield connection
             except BaseException:
@@ -99,6 +122,8 @@ class Database:
                 raise
             else:
                 connection.commit()
+            finally:
+                del self._local.transaction_connection
 
     def initialize(self) -> int:
         """Create the database if needed and apply every unapplied migration.
@@ -127,6 +152,7 @@ class Database:
                 """
             )
 
+        self._validate_migration_history(migrations)
         for migration in migrations:
             self._apply_migration(migration)
         return self.schema_version()
@@ -142,6 +168,34 @@ class Database:
                 "SELECT COALESCE(MAX(version), 0) AS version FROM schema_migrations"
             ).fetchone()
             return int(row["version"])
+
+    def latest_schema_version(self) -> int:
+        """Return the greatest packaged migration version without opening SQLite."""
+
+        migrations = self._discover_migrations()
+        return migrations[-1].version
+
+    def migration_manifest_is_current(self) -> bool:
+        """Verify an exact, fully applied migration manifest without writing."""
+
+        migrations = self._discover_migrations()
+        with self.connection() as connection:
+            exists = connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_migrations'"
+            ).fetchone()
+            if exists is None:
+                return False
+            rows = connection.execute(
+                "SELECT version,name,checksum FROM schema_migrations ORDER BY version"
+            ).fetchall()
+        if len(rows) != len(migrations):
+            return False
+        return all(
+            int(row["version"]) == migration.version
+            and str(row["name"]) == migration.name
+            and str(row["checksum"]) == migration.checksum
+            for row, migration in zip(rows, migrations, strict=True)
+        )
 
     def foreign_key_violations(self) -> list[sqlite3.Row]:
         """Return SQLite's current foreign-key integrity report."""
@@ -191,8 +245,48 @@ class Database:
             raise MigrationError(f"no SQL migrations found in {self.migrations_path}")
         return sorted(migrations, key=lambda migration: migration.version)
 
+    def _validate_migration_history(self, migrations: Sequence[Migration]) -> None:
+        """Reject altered, gapped, or newer migration histories before applying."""
+
+        with self.connection() as connection:
+            rows = connection.execute(
+                "SELECT version,name,checksum FROM schema_migrations ORDER BY version"
+            ).fetchall()
+        if len(rows) > len(migrations):
+            newest = int(rows[-1]["version"])
+            raise MigrationError(
+                f"database schema version {newest} is newer than this LegiView build"
+            )
+        expected_prefix = migrations[: len(rows)]
+        for position, (row, migration) in enumerate(
+            zip(rows, expected_prefix, strict=True), start=1
+        ):
+            version = int(row["version"])
+            if version != migration.version:
+                raise MigrationError(
+                    "database migration history is not a contiguous packaged prefix "
+                    f"at position {position}: found version {version}, expected {migration.version}"
+                )
+            if str(row["name"]) != migration.name:
+                raise MigrationError(
+                    f"migration {version} name differs from the packaged migration"
+                )
+            if str(row["checksum"]) != migration.checksum:
+                raise MigrationError(
+                    f"migration {version} ({migration.name}) was modified after it was applied"
+                )
+
     def _apply_migration(self, migration: Migration) -> None:
-        with self.transaction() as connection:
+        # SQLite cannot rebuild a referenced table while foreign-key enforcement
+        # is enabled.  A migration may nevertheless need such a rebuild (for
+        # example, to expand a CHECK constraint).  Disable enforcement *before*
+        # beginning the migration transaction, then run a full integrity check
+        # before committing.  Connections used by application code continue to
+        # enable foreign keys normally in ``connect``.
+        connection = self.connect()
+        try:
+            connection.execute("PRAGMA foreign_keys = OFF")
+            connection.execute("BEGIN IMMEDIATE")
             applied = connection.execute(
                 "SELECT name, checksum FROM schema_migrations WHERE version = ?",
                 (migration.version,),
@@ -203,10 +297,21 @@ class Database:
                         f"migration {migration.version} ({migration.name}) was modified after "
                         "it was applied"
                     )
+                connection.rollback()
                 return
 
             for statement in _sql_statements(migration.sql):
                 connection.execute(statement)
+            violations = connection.execute("PRAGMA foreign_key_check").fetchall()
+            if violations:
+                sample = ", ".join(
+                    f"{row[0]} row {row[1]} -> {row[2]}"
+                    for row in violations[:5]
+                )
+                raise MigrationError(
+                    f"migration {migration.version} ({migration.name}) introduced "
+                    f"{len(violations)} foreign-key violation(s): {sample}"
+                )
             connection.execute(
                 """
                 INSERT INTO schema_migrations(version, name, checksum, applied_at)
@@ -215,6 +320,17 @@ class Database:
                 (migration.version, migration.name, migration.checksum),
             )
             connection.execute(f"PRAGMA user_version = {migration.version:d}")
+            connection.commit()
+        except BaseException:
+            if connection.in_transaction:
+                connection.rollback()
+            raise
+        finally:
+            # This is mostly documentary because the connection is about to be
+            # closed, but it prevents a future refactor from accidentally reusing
+            # it with enforcement disabled.
+            connection.execute("PRAGMA foreign_keys = ON")
+            connection.close()
 
 
 def _sql_statements(script: str) -> Iterator[str]:
@@ -255,4 +371,3 @@ __all__ = [
     "get_connection",
     "initialize_database",
 ]
-

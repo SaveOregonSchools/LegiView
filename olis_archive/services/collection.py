@@ -6,6 +6,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 import json
 import logging
+import threading
 import time
 from typing import Any, Iterable, Mapping
 
@@ -25,15 +26,25 @@ from .downloads import (
     Downloader,
     LowDiskSpace,
     RetryPolicy,
+    SafeHTTPClient,
     retry_delay_seconds,
 )
 from .file_types import validate_file
+from .historical_collection import HistoricalCollectionService, HistoricalRunControl
 from .odata import (
     ODataClient,
     odata_datetime_literal,
     odata_literal,
 )
 from .olis_http import OLISHTTPClient
+from .probes import RemoteSizeProbe
+from .record_mapping import (
+    committee_display as map_committee_display,
+    map_committee as map_committee_record,
+    map_legislator as map_legislator_record,
+    map_meeting as map_meeting_record,
+    map_session as map_session_record,
+)
 from .runs import RunStore
 from .source_mapping import (
     chamber_for_code,
@@ -42,7 +53,7 @@ from .source_mapping import (
     normalize_bill_id,
     normalize_session_key,
 )
-from .storage import StorageService
+from .storage import MATCHING_RETRY_DOWNLOAD_STATUSES, StorageService
 from .testimony_parser import ParsedTestimonyDocument, parse_testimony_page
 
 
@@ -63,6 +74,12 @@ class CollectionSuspended(RuntimeError):
     def __init__(self, status: str) -> None:
         super().__init__(f"Collection is {status}")
         self.status = status
+
+
+class _DownloadFinalizationError(RuntimeError):
+    """A promoted payload could not be committed to its still-owned DB claim."""
+
+    retryable = True
 
 
 class SourceRecordNotFound(RuntimeError):
@@ -105,8 +122,13 @@ class CollectionService:
         sleep=time.sleep,
     ) -> None:
         self.config = config
-        self.database = database or Database(config.database_path)
-        self.database.initialize()
+        if database is None:
+            self.database = Database(config.database_path)
+            self.database.initialize()
+        else:
+            # Shared runtime bootstrap already initialized or verified this
+            # database, potentially while holding the process ownership lock.
+            self.database = database
         self.storage = StorageService(self.database, initialize=False)
         self.runs = RunStore(self.database)
         self.odata = odata or ODataClient(
@@ -127,8 +149,27 @@ class CollectionService:
             timeout_seconds=config.request_timeout,
             user_agent=config.user_agent,
             minimum_free_space_bytes=config.minimum_free_space_bytes,
+            require_https=True,
+            allowed_ports={443},
         )
         self.sleep = sleep
+        probe_http = getattr(self.downloader, "client", None) or SafeHTTPClient(
+            allowed_hosts=DEFAULT_ALLOWED_DOWNLOAD_HOSTS,
+            timeout_seconds=config.request_timeout,
+            user_agent=config.user_agent,
+            require_https=True,
+            allowed_ports={443},
+        )
+        self.historical = HistoricalCollectionService(
+            config,
+            database=self.database,
+            storage=self.storage,
+            runs=self.runs,
+            odata=self.odata,
+            olis_http=self.olis_http,
+            size_probe=RemoteSizeProbe(probe_http, sleep=sleep),
+            download_claimed=self._download_claimed_document,
+        )
 
     # -- durable run creation ------------------------------------------------
 
@@ -159,6 +200,11 @@ class CollectionService:
         source = self.runs.get_run(source_run_id)
         if not source:
             raise KeyError(f"Collection run {source_run_id} does not exist")
+        if source.get("run_type") in {"inventory_backfill", "download_archive"}:
+            raise ValueError(
+                "Historical archive retries must use Download Archive with its "
+                "frozen session scope and retryable-failures-only filter."
+            )
         retryable = self.storage.list_documents_for_retry(
             run_id=source_run_id,
             include_terminal=True,
@@ -174,16 +220,128 @@ class CollectionService:
         )
         return run_id
 
+    def create_retry_matching_run(
+        self,
+        *,
+        source_run_id: int | None = None,
+        session_key: str | None = None,
+        bill_id_compact: str | None = None,
+    ) -> tuple[int, int]:
+        """Freeze every filtered retry candidate without a JSON ID list."""
+
+        session = session_key.strip().upper() if session_key else None
+        bill = (
+            bill_id_compact.replace(" ", "").strip().upper()
+            if bill_id_compact
+            else None
+        )
+        retry_match = {
+            "source_run_id": source_run_id,
+            "session_key": session,
+            "bill_id_compact": bill,
+            "include_terminal": True,
+            "eligible_statuses": sorted(MATCHING_RETRY_DOWNLOAD_STATUSES),
+        }
+        scope = {
+            "source_run_id": source_run_id,
+            "selection": "all_matching",
+            "retry_match": retry_match,
+        }
+        # BEGIN IMMEDIATE makes the filtered INSERT...SELECT and its run row one
+        # exact durable snapshot while keeping the Python scope constant-sized.
+        with self.database.transaction() as connection:
+            run_id = self.runs.create_run(
+                "retry_failures",
+                session_key=session,
+                bill_id_compact=bill,
+                scope=scope,
+                config_snapshot=self.config.snapshot(),
+                bills_total=0,
+            )
+            matching_count = self.storage.snapshot_retry_matching_items(
+                run_id,
+                source_run_id=source_run_id,
+                session_key=session,
+                bill_id_compact=bill,
+                include_terminal=True,
+            )
+            if matching_count < 1:
+                raise ValueError("No failed documents match the selected filters")
+            retry_match["matching_count"] = matching_count
+            connection.execute(
+                "UPDATE collection_runs SET requested_scope_json=? WHERE id=?",
+                (
+                    json.dumps(
+                        scope,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        default=str,
+                    ),
+                    run_id,
+                ),
+            )
+        return run_id, matching_count
+
+    def historical_session_scope(self):  # noqa: ANN201
+        return self.historical.historical_session_scope()
+
+    def create_inventory_backfill_run(
+        self,
+        session_keys: Iterable[str] | None = None,
+        *,
+        probe_remote_sizes: bool = False,
+        force_full: bool = False,
+    ) -> int:
+        return self.historical.create_inventory_backfill_run(
+            session_keys,
+            probe_remote_sizes=probe_remote_sizes,
+            force_full=force_full,
+        )
+
+    def download_archive_preflight(
+        self,
+        session_keys: Iterable[str] | None = None,
+        *,
+        document_kinds: Iterable[str] | None = None,
+        retryable_failures_only: bool = False,
+        missing_pending_only: bool = True,
+    ):
+        return self.historical.download_preflight(
+            session_keys,
+            document_kinds=document_kinds,
+            retryable_failures_only=retryable_failures_only,
+            missing_pending_only=missing_pending_only,
+        )
+
+    def create_download_archive_run(
+        self,
+        session_keys: Iterable[str] | None = None,
+        *,
+        document_kinds: Iterable[str] | None = None,
+        retryable_failures_only: bool = False,
+        missing_pending_only: bool = True,
+    ) -> int:
+        return self.historical.create_download_archive_run(
+            session_keys,
+            document_kinds=document_kinds,
+            retryable_failures_only=retryable_failures_only,
+            missing_pending_only=missing_pending_only,
+        )
+
     # -- execution -----------------------------------------------------------
 
-    def execute_run(self, run_id: int) -> str:
-        if not self.runs.claim_run(run_id):
+    def execute_run(self, run_id: int, *, _already_claimed: bool = False) -> str:
+        if not _already_claimed and not self.runs.claim_run(run_id):
             row = self.runs.get_run(run_id)
             if row is None:
                 raise KeyError(f"Collection run {run_id} does not exist")
             return str(row["status"])
         run = self.runs.get_run(run_id)
-        assert run is not None
+        if run is None:
+            raise KeyError(f"Collection run {run_id} does not exist")
+        if run["status"] != "running":
+            return str(run["status"])
         try:
             scope = _json_object(run.get("requested_scope_json"))
             if run["run_type"] == "collect_bill":
@@ -201,17 +359,42 @@ class CollectionService:
                     max_bills=scope.get("max_bills"),
                 )
             elif run["run_type"] == "retry_failures":
-                summary = self.retry_failures(run_id, [int(value) for value in scope.get("document_ids", [])])
+                retry_match = scope.get("retry_match")
+                if isinstance(retry_match, Mapping):
+                    summary = self.retry_matching_failures(run_id, retry_match)
+                else:
+                    summary = self.retry_failures(
+                        run_id,
+                        [int(value) for value in scope.get("document_ids", [])],
+                    )
+            elif run["run_type"] == "inventory_backfill":
+                summary = self.historical.execute_inventory_backfill(run_id, scope)
+            elif run["run_type"] == "download_archive":
+                summary = self.historical.execute_download_archive(run_id, scope)
             else:  # constrained by SQL, retained for defensive readability
                 raise ValueError(f"Unknown collection run type: {run['run_type']}")
             current_status = self.runs.status(run_id)
             if current_status in {"canceled", "paused", "interrupted"}:
                 return current_status
-            return self.runs.finish_run(run_id, summary=summary)
+            return self.runs.finish_run(
+                run_id,
+                summary=summary,
+                session_key=(
+                    run.get("requested_session_key")
+                    if run["run_type"] not in {"inventory_backfill", "download_archive"}
+                    else None
+                ),
+            )
         except CollectionCanceled:
             self.runs.cancel(run_id)
             return "canceled"
         except CollectionSuspended as exc:
+            return exc.status
+        except HistoricalRunControl as exc:
+            if run["run_type"] == "inventory_backfill":
+                self.storage.stop_session_inventory_run(run_id, exc.status)
+            if exc.status == "canceled":
+                self.runs.cancel(run_id)
             return exc.status
         except Exception as exc:
             current = self.runs.get_run(run_id) or run
@@ -268,6 +451,7 @@ class CollectionService:
                 item_key=f"bill:{compact}",
                 item_type="bill",
                 progress_total=1,
+                session_key=session_key,
             )
             try:
                 result = self.collect_bill(
@@ -339,7 +523,13 @@ class CollectionService:
         committee_ids = reference_data.committee_ids
 
         self._check_canceled(run_id)
-        self.runs.begin_stage(run_id, "load_measure", f"Loading {compact}", item_key=stage_key("load_measure"))
+        self.runs.begin_stage(
+            run_id,
+            "load_measure",
+            f"Loading {compact}",
+            item_key=stage_key("load_measure"),
+            session_key=session_key,
+        )
         raw_measure = dict(known_measure) if known_measure is not None else self.odata.get_measure(session_key, prefix, number)
         if not raw_measure:
             raise SourceRecordNotFound(f"OData measure {session_key}/{compact} was not found")
@@ -349,7 +539,13 @@ class CollectionService:
         bill_pk = self.storage.upsert_bill(measure, run_id=run_id)
 
         self._check_canceled(run_id)
-        sponsor_item = self.runs.begin_stage(run_id, "load_sponsors", f"Loading sponsors for {compact}", item_key=stage_key("load_sponsors"))
+        sponsor_item = self.runs.begin_stage(
+            run_id,
+            "load_sponsors",
+            f"Loading sponsors for {compact}",
+            item_key=stage_key("load_sponsors"),
+            session_key=session_key,
+        )
         sponsor_rows = self.odata.for_measure(
             "MeasureSponsors", session_key, prefix, number, orderby="PrintOrder,MeasureSponsorId"
         )
@@ -389,6 +585,7 @@ class CollectionService:
             "discover_committee_documents",
             f"Discovering committee context for {compact}",
             item_key=stage_key("discover_committee_documents"),
+            session_key=session_key,
         )
         agenda_rows = self.odata.for_measure("CommitteeAgendaItems", session_key, prefix, number)
         committee_doc_rows = self.odata.for_measure(
@@ -439,6 +636,7 @@ class CollectionService:
             "discover_floor_letters",
             f"Discovering floor letters for {compact}",
             item_key=stage_key("discover_floor_letters"),
+            session_key=session_key,
         )
         floor_rows = self.odata.for_measure("FloorLetters", session_key, prefix, number, orderby="LetterDate,FloorLetterId")
         self.runs.update_progress(run_id, floor_item, len(floor_rows), f"Found {len(floor_rows)} floor letters")
@@ -449,6 +647,7 @@ class CollectionService:
             "discover_public_testimony",
             f"Discovering submitted testimony for {compact}",
             item_key=stage_key("discover_public_testimony"),
+            session_key=session_key,
         )
         public_rows = self.odata.for_measure(
             "CommitteePublicTestimonies", session_key, prefix, number, orderby="CommTestId"
@@ -490,6 +689,7 @@ class CollectionService:
             "normalize_documents",
             f"Reconciling document sources for {compact}",
             item_key=stage_key("normalize_documents"),
+            session_key=session_key,
         )
         html_committee_ids = {
             row.source_document_id
@@ -552,6 +752,7 @@ class CollectionService:
                 for document_id in document_ids
                 if self._is_download_candidate(self.storage.get_document(document_id) or {})
             ),
+            session_key=session_key,
         )
         download_summary = self._download_documents(run_id, bill_pk, document_ids, download_item)
         self.runs.set_counters(
@@ -584,11 +785,13 @@ class CollectionService:
 
     def retry_failures(self, run_id: int, document_ids: Iterable[int]) -> dict[str, Any]:
         ids = list(dict.fromkeys(int(value) for value in document_ids))
+        run = self.runs.get_run(run_id)
         item = self.runs.begin_stage(
             run_id,
             "download_documents",
             f"Retrying {len(ids)} failed downloads",
             progress_total=len(ids),
+            session_key=run.get("requested_session_key") if run else None,
         )
         bills = {
             int(document["bill_id"])
@@ -607,6 +810,105 @@ class CollectionService:
         )
         return summary
 
+    def retry_matching_failures(
+        self, run_id: int, retry_match: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        """Process an exact retry snapshot through bounded atomic claims."""
+
+        matching_count = max(0, int(retry_match.get("matching_count") or 0))
+        session_key = str(retry_match.get("session_key") or "").strip() or None
+        stage_item = self.runs.begin_stage(
+            run_id,
+            "download_documents",
+            f"Retrying {matching_count} matching failed downloads",
+            progress_total=matching_count,
+            session_key=session_key,
+        )
+        progress_lock = threading.Lock()
+        processed = 0
+
+        def worker() -> None:
+            nonlocal processed
+            while self.runs.status(run_id) == "running":
+                document = self.storage.claim_next_retry_document(run_id)
+                if document is None:
+                    return
+                _document_id, _outcome, byte_count = self._download_claimed_document(
+                    run_id, document
+                )
+                del byte_count
+                with progress_lock:
+                    processed += 1
+                    self.runs.update_progress(
+                        run_id,
+                        stage_item,
+                        processed,
+                        f"Processed {processed} of {matching_count} matching failures",
+                    )
+
+        with ThreadPoolExecutor(
+            max_workers=max(1, self.config.download_worker_count),
+            thread_name_prefix="legiview-retry",
+        ) as pool:
+            futures = [
+                pool.submit(worker)
+                for _ in range(max(1, self.config.download_worker_count))
+            ]
+            for future in futures:
+                future.result()
+
+        with self.database.connection() as connection:
+            item_counts = {
+                str(row["status"]): int(row["count"])
+                for row in connection.execute(
+                    """
+                    SELECT status,COUNT(*) AS count
+                    FROM collection_run_items
+                    WHERE run_id=? AND item_type='document'
+                    GROUP BY status
+                    """,
+                    (run_id,),
+                ).fetchall()
+            }
+        finished_count = sum(
+            item_counts.get(status, 0)
+            for status in (
+                "completed",
+                "skipped",
+                "failed_retryable",
+                "failed_terminal",
+                "canceled",
+            )
+        )
+        self.runs.update_progress(
+            run_id,
+            stage_item,
+            finished_count,
+            f"Processed {finished_count} of {matching_count} matching failures",
+        )
+        self.runs.set_counters(
+            run_id,
+            documents_discovered=matching_count,
+            documents_queued=matching_count,
+            documents_downloaded=item_counts.get("completed", 0),
+            documents_skipped=item_counts.get("skipped", 0),
+            documents_failed=(
+                item_counts.get("failed_retryable", 0)
+                + item_counts.get("failed_terminal", 0)
+            ),
+        )
+        status = self.runs.status(run_id)
+        if status == "canceled":
+            raise CollectionCanceled()
+        if status in {"paused", "interrupted"}:
+            raise CollectionSuspended(status)
+        durable_run = self.runs.get_run(run_id) or {}
+        return {
+            "matching_count": matching_count,
+            "item_counts": item_counts,
+            "bytes_downloaded": int(durable_run.get("bytes_downloaded") or 0),
+        }
+
     # -- source/payload helpers ---------------------------------------------
 
     def _load_session_record(self, run_id: int, session_key: str, *, item_key: str) -> int:
@@ -616,6 +918,7 @@ class CollectionService:
             "load_session",
             f"Loading {session_key}",
             item_key=item_key,
+            session_key=session_key,
         )
         raw_session = self.odata.get_session(session_key)
         if not raw_session:
@@ -637,6 +940,7 @@ class CollectionService:
             "load_reference_data",
             f"Loading legislators and committees for {session_key}",
             item_key=item_key,
+            session_key=session_key,
         )
         base_filter = f"SessionKey eq {odata_literal(session_key)}"
 
@@ -753,7 +1057,13 @@ class CollectionService:
                 continue
             actual_bill_id = int(document["bill_id"])
             item_key = f"{document['source_entity_type']}:{document['source_id']}"
-            self.runs.add_document_item(run_id, document_id, actual_bill_id, item_key)
+            self.runs.add_document_item(
+                run_id,
+                document_id,
+                actual_bill_id,
+                item_key,
+                session_key=str(document["session_key"]),
+            )
             existing = self._valid_completed_document(document)
             if existing and not self._source_changed(document):
                 self.runs.mark_document_item(run_id, document_id, "skipped", "Valid completed file already present")
@@ -845,22 +1155,121 @@ class CollectionService:
                         raise CollectionSuspended("interrupted")
         return summary
 
-    def _download_one(self, run_id: int, document: Mapping[str, Any], version_number: int) -> tuple[int, str, int]:
+    def _download_claimed_document(
+        self, run_id: int, document: Mapping[str, Any]
+    ) -> tuple[int, str, int]:
+        """Run the proven Phase 1 transfer path for a DB-preclaimed document."""
+
+        document_id = int(document["id"])
+        try:
+            return self._download_one(
+                run_id,
+                document,
+                self._next_version_number(document_id),
+                already_claimed=True,
+            )
+        except CollectionCanceled:
+            self.storage.release_archive_document_claim(
+                run_id,
+                document_id,
+                document_status="interrupted",
+                item_status="canceled",
+                message="Download canceled while preparing or retrying the transfer",
+            )
+            return document_id, "canceled", 0
+        except CollectionSuspended as exc:
+            item_status = "paused" if exc.status == "paused" else "interrupted"
+            self.storage.release_archive_document_claim(
+                run_id,
+                document_id,
+                document_status="interrupted",
+                item_status=item_status,
+                message=f"Download {exc.status} while preparing or retrying the transfer",
+            )
+            return document_id, item_status, 0
+        except Exception as exc:
+            retryable = _is_retryable(exc)
+            status = "failed_retryable" if retryable else "failed_terminal"
+            self.storage.release_archive_document_claim(
+                run_id,
+                document_id,
+                document_status=status,
+                item_status=status,
+                message=str(exc),
+            )
+            self.runs.record_error(
+                run_id,
+                stage="download_archive",
+                error=exc,
+                retryable=retryable,
+                session_key=str(document.get("session_key") or "") or None,
+                bill_id_compact=str(document.get("bill_id_compact") or "") or None,
+                source_entity_type=str(document.get("source_entity_type") or "") or None,
+                source_id=str(document.get("source_id") or "") or None,
+                document_id=document_id,
+                source_url=document.get("canonical_download_url"),
+                details=(
+                    {
+                        "claim_finalization_failure": True,
+                        "cause_class": (
+                            type(exc.__cause__).__name__
+                            if exc.__cause__ is not None
+                            else None
+                        ),
+                    }
+                    if isinstance(exc, _DownloadFinalizationError)
+                    else {"claim_setup_failure": True}
+                ),
+            )
+            return document_id, "failed", 0
+
+    def _download_one(
+        self,
+        run_id: int,
+        document: Mapping[str, Any],
+        version_number: int,
+        *,
+        already_claimed: bool = False,
+    ) -> tuple[int, str, int]:
         document_id = int(document["id"])
         run_status = self.runs.status(run_id)
         if run_status == "paused":
-            self.runs.mark_document_item(
-                run_id, document_id, "paused", "Deferred because the run is paused"
-            )
+            if already_claimed:
+                self.storage.release_archive_document_claim(
+                    run_id,
+                    document_id,
+                    document_status="interrupted",
+                    item_status="paused",
+                    message="Deferred because the run is paused",
+                )
+            else:
+                self.runs.mark_document_item(
+                    run_id, document_id, "paused", "Deferred because the run is paused"
+                )
             return document_id, "paused", 0
         if run_status == "interrupted":
-            self.runs.mark_document_item(
-                run_id, document_id, "interrupted", "Deferred because the run was interrupted"
-            )
+            if already_claimed:
+                self.storage.release_archive_document_claim(
+                    run_id,
+                    document_id,
+                    document_status="interrupted",
+                    item_status="interrupted",
+                    message="Deferred because the run was interrupted",
+                )
+            else:
+                self.runs.mark_document_item(
+                    run_id, document_id, "interrupted", "Deferred because the run was interrupted"
+                )
             return document_id, "interrupted", 0
         if run_status == "canceled":
+            if already_claimed:
+                self.storage.update_document_download_state(
+                    document_id,
+                    "interrupted",
+                    last_error="Download canceled before transfer started",
+                )
             return document_id, "canceled", 0
-        if not self._claim_download_attempt(run_id, document):
+        if not already_claimed and not self._claim_download_attempt(run_id, document):
             return document_id, "failed", 0
         title = _text(document.get("title")) or f"{document['document_kind']}-{document['source_id']}"
         destination = archive_document_path(
@@ -882,14 +1291,49 @@ class CollectionService:
                     archive_root=self.config.archive_root,
                     cancellation_requested=lambda: self.runs.should_abort_active_work(run_id),
                 )
-                self._record_download_result(run_id, document, result)
-                self.runs.mark_document_item(
-                    run_id,
-                    document_id,
-                    "skipped" if result.skipped else "completed",
-                    "Validated existing bytes" if result.skipped else "Downloaded and validated",
-                )
+                outcome_status = "skipped" if result.skipped else "completed"
+                try:
+                    with self.database.transaction():
+                        self._record_download_result(run_id, document, result)
+                        message = (
+                            "Validated existing bytes"
+                            if result.skipped
+                            else "Downloaded and validated"
+                        )
+                        if already_claimed:
+                            finalized = self.runs.finalize_claimed_document_item(
+                                run_id,
+                                document_id,
+                                outcome_status,
+                                message,
+                            )
+                            if not finalized:
+                                self._raise_claim_finalization_control(run_id, document_id)
+                        else:
+                            self.runs.mark_document_item(
+                                run_id,
+                                document_id,
+                                outcome_status,
+                                message,
+                            )
+                        if already_claimed and not result.skipped:
+                            # Claimed archive/retry workers have no later aggregate
+                            # transaction. Keep their durable byte counter in the
+                            # same commit as the document version and run-item result.
+                            self.runs.add_downloaded_bytes(run_id, result.byte_count)
+                except (CollectionCanceled, CollectionSuspended, _DownloadFinalizationError):
+                    raise
+                except Exception as exc:
+                    if already_claimed:
+                        # The file may already be atomically visible. Preserve it
+                        # as an adoptable orphan and keep the document retryable.
+                        raise _DownloadFinalizationError(
+                            "Downloaded payload could not be durably finalized"
+                        ) from exc
+                    raise
                 return document_id, "skipped" if result.skipped else "downloaded", 0 if result.skipped else result.byte_count
+            except (CollectionCanceled, CollectionSuspended, _DownloadFinalizationError):
+                raise
             except LowDiskSpace as exc:
                 self.storage.update_document_download_state(
                     document_id, "paused_low_space", last_error=str(exc), validation_status="not_validated"
@@ -972,6 +1416,33 @@ class CollectionService:
                 )
                 return document_id, "failed", 0
         return document_id, "failed", 0
+
+    def _raise_claim_finalization_control(
+        self, run_id: int, document_id: int
+    ) -> None:
+        """Translate a lost success transition without overwriting control state."""
+
+        with self.database.connection() as connection:
+            state = connection.execute(
+                """
+                SELECT r.status AS run_status,i.status AS item_status
+                FROM collection_runs r
+                LEFT JOIN collection_run_items i
+                  ON i.run_id=r.id AND i.item_type='document' AND i.document_id=?
+                WHERE r.id=?
+                """,
+                (document_id, run_id),
+            ).fetchone()
+        if state is not None:
+            statuses = {str(state["run_status"]), str(state["item_status"] or "")}
+            if "canceled" in statuses:
+                raise CollectionCanceled()
+            for status in ("paused", "interrupted"):
+                if status in statuses:
+                    raise CollectionSuspended(status)
+        raise _DownloadFinalizationError(
+            "Document payload completed after its durable download claim was lost"
+        )
 
     def _claim_download_attempt(self, run_id: int, document: Mapping[str, Any]) -> bool:
         """Claim both durable ledgers or persist a retryable orchestration error."""
@@ -1152,79 +1623,23 @@ class CollectionService:
 
 
 def _map_session(raw: Mapping[str, Any]) -> dict[str, Any]:
-    key = str(raw["SessionKey"])
-    return {
-        "session_key": key,
-        "source_session_id": key,
-        "session_name": _text(raw.get("SessionName")),
-        "session_year": int(key[:4]),
-        "begin_date": _text(raw.get("BeginDate")),
-        "end_date": _text(raw.get("EndDate")),
-        "source_url": f"https://olis.oregonlegislature.gov/liz/{key}",
-        "source_created_at": _text(raw.get("CreatedDate")),
-        "source_modified_at": _text(raw.get("ModifiedDate")),
-        "raw_json": dict(raw),
-    }
+    return map_session_record(raw)
 
 
 def _map_legislator(raw: Mapping[str, Any]) -> dict[str, Any]:
-    first = _text(raw.get("FirstName"))
-    last = _text(raw.get("LastName"))
-    return {
-        "session_key": str(raw["SessionKey"]),
-        "legislator_code": str(raw["LegislatorCode"]),
-        "first_name": first,
-        "last_name": last,
-        "display_name": " ".join(part for part in (first, last) if part),
-        "chamber": chamber_for_code(raw.get("Chamber")),
-        "party": _text(raw.get("Party")),
-        "district": _text(raw.get("DistrictNumber")),
-        "email": _text(raw.get("EmailAddress")),
-        "source_created_at": _text(raw.get("CreatedDate")),
-        "source_modified_at": _text(raw.get("ModifiedDate")),
-        "raw_json": dict(raw),
-    }
+    return map_legislator_record(raw)
 
 
 def _map_committee(raw: Mapping[str, Any]) -> dict[str, Any]:
-    return {
-        "session_key": str(raw["SessionKey"]),
-        "committee_code": str(raw["CommitteeCode"]),
-        "committee_name": _text(raw.get("CommitteeName")),
-        "house_of_action": _text(raw.get("HouseOfAction")),
-        "chamber": chamber_for_code(raw.get("HouseOfAction")),
-        "committee_type": _text(raw.get("CommitteeType")),
-        "source_created_at": _text(raw.get("CreatedDate")),
-        "source_modified_at": _text(raw.get("ModifiedDate")),
-        "raw_json": dict(raw),
-    }
+    return map_committee_record(raw)
 
 
 def _committee_display(raw: Mapping[str, Any]) -> str:
-    kind = _text(raw.get("CommitteeType")) or ""
-    name = _text(raw.get("CommitteeName")) or str(raw.get("CommitteeCode") or "")
-    if kind and kind.casefold() not in name.casefold():
-        return f"{kind} {name}".strip()
-    return name
+    return map_committee_display(raw)
 
 
 def _map_meeting(raw: Mapping[str, Any], committee_id: int | None, committee_name: str | None) -> dict[str, Any]:
-    key = f"{raw['CommitteeCode']}|{raw['MeetingDate']}"
-    return {
-        "session_key": str(raw["SessionKey"]),
-        "source_meeting_id": key,
-        "committee_id": committee_id,
-        "committee_code": _text(raw.get("CommitteeCode")),
-        "committee_name": committee_name,
-        "meeting_date": _text(raw.get("MeetingDate")),
-        "location": _text(raw.get("Location")) or _text(raw.get("AlternateLocation")),
-        "meeting_type": _text(raw.get("MeetingStatus")),
-        "agenda_url": _text(raw.get("AgendaUrl")),
-        "source_url": _text(raw.get("AgendaUrl")),
-        "source_created_at": _text(raw.get("CreatedDate")),
-        "source_modified_at": _text(raw.get("ModifiedDate")),
-        "raw_json": dict(raw),
-    }
+    return map_meeting_record(raw, committee_id, committee_name)
 
 
 def _result_dict(result: BillCollectionResult) -> dict[str, Any]:

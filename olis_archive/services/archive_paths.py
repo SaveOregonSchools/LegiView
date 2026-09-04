@@ -19,6 +19,9 @@ DOCUMENT_KINDS = frozenset(
     }
 )
 
+ARCHIVE_OWNERSHIP_MARKER = ".legiview-archive-root"
+_ARCHIVE_OWNERSHIP_CONTENT = b"LegiView archive root\nformat=1\n"
+
 WINDOWS_RESERVED_NAMES = frozenset(
     {
         "con",
@@ -40,6 +43,85 @@ class UnsafeArchivePath(ValueError):
 
 class ArchivePathCollision(FileExistsError):
     """A deterministic destination is already occupied by unrelated bytes."""
+
+
+def validate_archive_root_candidate(archive_root: str | Path) -> Path:
+    """Validate a proposed dedicated archive root without changing it.
+
+    An existing root is accepted only when it has LegiView's ownership marker,
+    is empty, or is an unmistakable marker-less archive using the legacy
+    session/bill/kind/source-ID hierarchy.  This prevents a broad directory
+    such as Documents from becoming the target of recursive startup cleanup.
+    """
+
+    raw_root = Path(archive_root).expanduser()
+    root = raw_root.resolve(strict=False)
+    if root == Path(root.anchor):
+        raise UnsafeArchivePath("Archive root cannot be a filesystem root.")
+    if _is_link_or_reparse_point(raw_root):
+        raise UnsafeArchivePath("Archive root must not be a link or reparse point.")
+    if not raw_root.exists():
+        return root
+    if not root.is_dir():
+        raise UnsafeArchivePath("Archive root points to an existing non-directory path.")
+
+    marker = root / ARCHIVE_OWNERSHIP_MARKER
+    if marker.exists() or marker.is_symlink():
+        _validate_archive_ownership_marker(marker)
+        return root
+
+    try:
+        entries = list(root.iterdir())
+    except OSError as exc:
+        raise UnsafeArchivePath(f"Archive root cannot be inspected safely: {root}") from exc
+    if not entries or _is_recognizable_legacy_archive(entries):
+        return root
+    raise UnsafeArchivePath(
+        "Archive root is a nonempty directory not owned by LegiView. Choose an empty "
+        f"dedicated directory or an existing LegiView archive containing {ARCHIVE_OWNERSHIP_MARKER}."
+    )
+
+
+def ensure_archive_root_owned(archive_root: str | Path) -> Path:
+    """Initialize or verify the marker authorizing archive-wide maintenance."""
+
+    root = validate_archive_root_candidate(archive_root)
+    root.mkdir(parents=True, exist_ok=True)
+    if not root.is_dir() or _is_link_or_reparse_point(root):
+        raise UnsafeArchivePath("Archive root must be a real directory, not a link or reparse point.")
+    marker = root / ARCHIVE_OWNERSHIP_MARKER
+    if marker.exists() or marker.is_symlink():
+        _validate_archive_ownership_marker(marker)
+        return root
+    try:
+        with marker.open("xb") as handle:
+            handle.write(_ARCHIVE_OWNERSHIP_CONTENT)
+            handle.flush()
+            os.fsync(handle.fileno())
+    except FileExistsError:
+        # A concurrent initializer may have won the exclusive create. It must
+        # still have written the one recognized marker before we trust it.
+        _validate_archive_ownership_marker(marker)
+    except OSError as exc:
+        raise UnsafeArchivePath(f"Could not initialize archive ownership marker: {marker}") from exc
+    return root
+
+
+def require_owned_archive_root(archive_root: str | Path) -> Path:
+    """Return an existing archive root only when its marker is valid."""
+
+    raw_root = Path(archive_root).expanduser()
+    root = raw_root.resolve(strict=False)
+    if root == Path(root.anchor):
+        raise UnsafeArchivePath("Archive root cannot be a filesystem root.")
+    if (
+        not raw_root.exists()
+        or not root.is_dir()
+        or _is_link_or_reparse_point(raw_root)
+    ):
+        raise UnsafeArchivePath("Archive maintenance requires an existing, non-linked archive root.")
+    _validate_archive_ownership_marker(root / ARCHIVE_OWNERSHIP_MARKER)
+    return root
 
 
 def sanitize_windows_filename(
@@ -246,6 +328,75 @@ def _is_link_or_reparse_point(path: Path) -> bool:
         return False
 
 
+def _validate_archive_ownership_marker(marker: Path) -> None:
+    if _is_link_or_reparse_point(marker):
+        raise UnsafeArchivePath("Archive ownership marker must not be a link or reparse point.")
+    try:
+        marker_stat = marker.stat()
+        if not marker.is_file() or marker_stat.st_size != len(_ARCHIVE_OWNERSHIP_CONTENT):
+            raise UnsafeArchivePath("Archive ownership marker is invalid or unsupported.")
+        with marker.open("rb") as handle:
+            content = handle.read(len(_ARCHIVE_OWNERSHIP_CONTENT) + 1)
+    except UnsafeArchivePath:
+        raise
+    except OSError as exc:
+        raise UnsafeArchivePath("Archive ownership marker cannot be read safely.") from exc
+    if content != _ARCHIVE_OWNERSHIP_CONTENT:
+        raise UnsafeArchivePath("Archive ownership marker is invalid or unsupported.")
+
+
+def _is_recognizable_legacy_archive(entries: list[Path]) -> bool:
+    """Recognize only the exact pre-marker archive hierarchy."""
+
+    has_payload = False
+    try:
+        for session in entries:
+            if not _safe_named_directory(session, _SESSION_KEY):
+                return False
+            for bill in session.iterdir():
+                if not _safe_named_directory(bill, _BILL_ID):
+                    return False
+                for kind in bill.iterdir():
+                    if (
+                        kind.name not in DOCUMENT_KINDS
+                        or not kind.is_dir()
+                        or _is_link_or_reparse_point(kind)
+                    ):
+                        return False
+                    for source_id in kind.iterdir():
+                        if not source_id.is_dir() or _is_link_or_reparse_point(source_id):
+                            return False
+                        if not source_id.name.isascii() or not source_id.name.isdigit():
+                            # Older runs/tests could leave an empty directory
+                            # after reserving a destination. It contains no
+                            # bytes for recursive cleanup to affect, while all
+                            # of its ancestors still prove this is an archive.
+                            if next(source_id.iterdir(), None) is None:
+                                continue
+                            return False
+                        for payload in source_id.iterdir():
+                            if (
+                                not payload.is_file()
+                                or _is_link_or_reparse_point(payload)
+                            ):
+                                return False
+                            has_payload = True
+    except OSError:
+        return False
+    # Directory names alone are too easy for an unrelated path to resemble.
+    # At least one regular payload/staged file provides positive evidence that
+    # this is a pre-marker LegiView archive rather than an empty lookalike.
+    return has_payload
+
+
+def _safe_named_directory(path: Path, pattern: re.Pattern[str]) -> bool:
+    return bool(
+        pattern.fullmatch(path.name)
+        and path.is_dir()
+        and not _is_link_or_reparse_point(path)
+    )
+
+
 def _is_windows_reserved_name(value: str) -> bool:
     # Windows reserves these device basenames even when an extension (or more
     # than one extension) is present.  NFKC above also converts superscript
@@ -255,12 +406,14 @@ def _is_windows_reserved_name(value: str) -> bool:
 
 
 __all__ = [
+    "ARCHIVE_OWNERSHIP_MARKER",
     "ArchivePathCollision",
     "DOCUMENT_KINDS",
     "UnsafeArchivePath",
     "archive_document_path",
     "collision_safe_destination",
     "ensure_archive_directory",
+    "ensure_archive_root_owned",
     "ensure_within_archive",
     "normalize_bill_id",
     "normalize_document_kind",
@@ -268,9 +421,11 @@ __all__ = [
     "normalize_source_id",
     "part_path_for",
     "relative_document_directory",
+    "require_owned_archive_root",
     "resolve_stored_path",
     "sanitize_filename",
     "sanitize_windows_filename",
     "stored_relative_path",
+    "validate_archive_root_candidate",
     "versioned_filename",
 ]

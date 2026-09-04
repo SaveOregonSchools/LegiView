@@ -1,38 +1,53 @@
 # LegiView
 
-LegiView is a local Flask application for collecting Oregon House and Senate bill
-metadata and in-scope documents from the Oregon Legislative Information System
-(OLIS). Phase 1 supports one explicitly selected bill or session, stores structured
-records and durable run state in SQLite, and archives validated document payloads in
-a deterministic filesystem hierarchy.
+LegiView is a local Flask application for building a durable Oregon legislative data
+and document archive. It catalogs every official Oregon HB/SB from session `2014R1`
+forward, reconciles testimony and historical presentations, and can then acquire
+validated payloads into ordinary files under a deterministic archive tree.
 
-The interface follows Save Oregon Schools' EdScanner visual language. Collection,
-parsing, persistence, downloading, and job execution live outside the Flask routes,
-so the web UI and CLI use the same services.
+Phase 2 extends the proven targeted bill/session collector with two separate,
+resumable workflows:
 
-## Before using Oregon Legislative data
+- **Inventory Backfill** discovers and reconciles metadata without downloading every
+  payload.
+- **Download Archive** consumes a frozen slice of that inventory and safely downloads
+  eligible current payloads.
+
+Source access, parsing, persistence, downloading, workers, and Flask routes remain
+separate. The web UI and CLI use the same durable collection services.
+
+## Before using Oregon legislative data
 
 Read the official [Oregon Legislative Data page](https://www.oregonlegislature.gov/citizen_engagement/Pages/data.aspx)
 and [Open Data acceptable-use agreement](https://www.oregonlegislature.gov/citizen_engagement/Documents/OLODataAcceptableUseAgreement.pdf)
 before running a collection.
 
-The Phase 1 source spike found that the published OData endpoint accepted ordinary
-filtered requests without presenting an HTML form, redirect, cookie, or other
-interactive acceptance gate. The linked agreement nevertheless says that users must
-electronically accept its terms. LegiView does not accept terms, automate an
-acceptance step, or bypass a gate for you. If the Legislature presents an acceptance
-step, stop and complete it yourself through the official process before continuing.
+The 2026-09-03 source spike and operator review found that ordinary filtered requests
+reached the published OData service without an HTML form, redirect, acceptance
+cookie, separate submission form, or other interactive gate. The operator explicitly
+confirmed that they reviewed and agreed to the published terms; no separate form to
+submit was found. The linked agreement nevertheless describes electronic acceptance.
+Before live collection, review and agree to the published terms; if the Legislature
+presents an official acceptance mechanism, use it. LegiView does not accept terms or
+bypass a gate for you.
 
-Keep the conservative defaults, prefer individual bill collection, use
-`--max-bills` while validating a session, honor any service response or restriction,
-and do not use LegiView to evade throttling. See
-[docs/source_mapping.md](docs/source_mapping.md) for the observed source behavior.
+Prefer OData, retain the conservative concurrency and delay defaults, honor
+429/`Retry-After` and all source instructions, and never use proxies, alternate-host
+evasion, CAPTCHA bypass, or rate-limit evasion. The current published agreement
+allows on-demand and incremental requests but limits whole-database/full refresh
+behavior to once per day after business hours, stated as **5:00 p.m.–6:00 a.m.
+Pacific**. Treat an all-history inventory as a full refresh and schedule it in that
+window.
 
-## Requirements and setup
+See [docs/source_mapping.md](docs/source_mapping.md) for observed source behavior.
 
-- Windows with Python 3.11 or newer
-- Network access to the official Oregon Legislature OData and OLIS hosts
-- Enough free disk space for the selected documents
+## Requirements
+
+- Python 3.11 or newer on Windows, Linux, or macOS
+- network access to the official Oregon Legislature OData and OLIS hosts
+- enough free disk for the selected archive scope
+
+### Windows setup
 
 From PowerShell in the repository root:
 
@@ -43,220 +58,282 @@ py -m venv .venv
 Copy-Item .env.example .env
 ```
 
-Edit `.env` before the first run. In particular, put the archive and database in
-dedicated locations that are normally outside this Git checkout:
-
-```dotenv
-LEGIVIEW_ARCHIVE_ROOT=C:\LegiViewArchive
-LEGIVIEW_DATABASE_PATH=C:\LegiViewData\legiview.sqlite3
-```
-
-The application creates those directories when possible. Do not choose a filesystem
-root such as `C:\` as the archive root. `.env`, SQLite files, the default `data/`
-directory, archives, and `.part` files are ignored by Git.
-
-LegiView uses an operating-system lock beside the SQLite database for every process
-that can mutate collection state or archive files. A second web server or mutating
-CLI command against the same database exits instead of running startup recovery
-concurrently. The read-only `show-bill` command does not take that lock and is safe to
-run while the web server is collecting. On shutdown, waiting work stays durably
-queued and active work is marked interrupted; the lock is not released while a
-worker can still mutate files.
-
-## Start the web application
-
-The standard Windows command is:
+Start the application with:
 
 ```powershell
 .\run.bat
 ```
 
-Equivalently:
+or:
 
 ```powershell
 .\.venv\Scripts\python.exe -m olis_archive serve
 ```
 
-Then open <http://127.0.0.1:5000/>. LegiView binds only to `127.0.0.1` by default.
-The explicit overrides are:
+### Linux/macOS setup
 
-```powershell
-.\.venv\Scripts\python.exe -m olis_archive serve --host 127.0.0.1 --port 5000
+```bash
+python3 -m venv .venv
+.venv/bin/python -m pip install --upgrade pip
+.venv/bin/python -m pip install -e '.[test]'
+cp .env.example .env
+.venv/bin/python -m olis_archive serve
 ```
 
-Put the global `--verbose` option before the command to show informational logs:
+Then open <http://127.0.0.1:5000/>. LegiView binds only to localhost by default.
+Use `serve --host` for another loopback address and `--port` for an explicit port.
+Put global `--verbose` before the command when informational logs are useful. The
+local web app accepts only loopback Host headers by default, which also protects
+against forged-host and DNS rebinding requests. Non-loopback hosting is outside the
+Phase 2 deployment scope.
 
-```powershell
-.\.venv\Scripts\python.exe -m olis_archive --verbose serve
+## Configuration
+
+The checked-in `.env.example` uses portable relative paths:
+
+```dotenv
+# Copy to .env or set these variables in your shell.
+# Optional base for relative paths. If omitted, LegiView uses the application root.
+# LEGIVIEW_PROJECT_ROOT=.
+
+LEGIVIEW_DATABASE_PATH=data/legiview.sqlite3
+LEGIVIEW_ARCHIVE_ROOT=archive
+
+LEGIVIEW_REQUEST_TIMEOUT=30
+LEGIVIEW_ODATA_WORKERS=1
+LEGIVIEW_DOWNLOAD_WORKERS=2
+LEGIVIEW_HTML_CONCURRENCY=1
+LEGIVIEW_MIN_FREE_SPACE_GB=5
+LEGIVIEW_INTER_REQUEST_DELAY=0.25
+LEGIVIEW_HOST=127.0.0.1
+LEGIVIEW_PORT=5000
+LEGIVIEW_DEBUG=0
 ```
 
-## Collect a bill in the UI
+Relative database/archive paths resolve against the effective
+`LEGIVIEW_PROJECT_ROOT`, never the caller's working directory. With no overrides the
+database is `<project_root>/data/legiview.sqlite3` and the archive is
+`<project_root>/archive`. Absolute Windows/POSIX paths remain supported.
 
-1. Open **Settings** and confirm the archive root, timeouts, worker counts, request
-   delay, and minimum free-space floor.
-2. Open **Collect a Bill**.
-3. Enter an official session key such as `2026R1` and an `HB` or `SB` identifier such
-   as `SB1501`.
-4. Submit the form. The request only creates and enqueues a durable run; source access
-   and downloads occur in bounded background workers.
-5. Follow the Run Detail page. An active page refreshes every 15 seconds from
-   persisted stage and item records.
-6. Use **Browse Bills** and **Browse Documents** to inspect the stored result. Bill
-   Detail separates chief and regular sponsors and groups documents by source class.
+The free-space setting is in GB, with one LegiView GB equal to `1024 ** 3` bytes.
+`LEGIVIEW_MIN_FREE_SPACE_GB` wins when present; otherwise the deprecated
+`LEGIVIEW_MIN_FREE_SPACE_BYTES` and legacy saved setting are converted for backward
+compatibility. Downloads pause before crossing the floor.
 
-Collect Session uses the same engine. A session can be large, so begin with a small
-**Maximum bills** value.
+The Settings page stores portable archive input, shows its resolved path and the
+effective project/database paths, and applies worker/archive changes after restart.
+See [docs/configuration.md](docs/configuration.md) for precedence and all variables.
 
-## Command-line interface
+## Inventory Backfill
 
-The CLI writes a durable run before doing work and prints a JSON result summary.
-Unlike the web UI, collection commands wait for the run to finish in the current
-terminal.
+Inventory Backfill resolves the official session catalogue and includes every
+session at or after the official `2014R1` `BeginDate`, including short and special
+sessions. Only HB/SB measures are in scope. The exact selected keys are frozen in the
+durable run.
+
+It pages and persists sessions, measures, references, sponsors, committee context,
+committee documents, `CommitteePublicTestimonies`, floor letters, normalized document
+identities, OLIS display reconciliation, source presence, and anomalies. Optional
+HEAD/bounded-Range probes estimate remote sizes. It never silently starts payload
+download.
+
+In the UI:
+
+1. Open **Inventory Backfill** (`/inventory-backfill`) and select **Resolve official
+   sessions**.
+2. Review the returned session list, completeness state, paths, disk space, source
+   limits, and acceptable-use reminder.
+3. Keep all sessions selected, or choose a validation subset.
+4. Optionally choose **Probe remote sizes**.
+5. Use **Force an authoritative full session comparison** only when a deliberate
+   disappearance check is needed; it ignores retained watermarks and is subject to
+   the published full-refresh window and daily limit.
+6. Press **Start Inventory Backfill** and follow the durable Run Detail.
+7. Review **Session Status**, documents, failures, and anomalies afterward.
+
+From the CLI, omitted session options mean the complete resolved scope. These and the
+remaining CLI examples use the Windows virtual-environment executable; on Linux/macOS,
+replace `.\.venv\Scripts\python.exe` with `.venv/bin/python`:
 
 ```powershell
-# Collect one bill.
+.\.venv\Scripts\python.exe -m olis_archive inventory-backfill
+.\.venv\Scripts\python.exe -m olis_archive inventory-backfill --session 2014R1 --session 2026R1 --probe-remote-sizes
+.\.venv\Scripts\python.exe -m olis_archive inventory-backfill --session 2014R1 --force-full
+```
+
+## Download Archive
+
+Download Archive operates only on inventoried records. Its session keys, optional
+document kinds/status mode, and inventory cutoff are frozen when the run is created.
+Rows are claimed atomically from SQLite in bounded batches; LegiView does not build an
+all-history in-memory queue.
+
+In the UI:
+
+1. Open **Download Archive** (`/download-archive`) after reviewing **Session Status**
+   (`/session-status`).
+2. Choose all inventoried or selected sessions, and optionally document kinds or the
+   retryable-failure mode.
+3. Select **Preview selected scope**, then review recorded-downloaded, pending,
+   failure, non-downloadable, known-byte,
+   unknown-size, disk-free, floor, archive-root, and worker-count preflight values.
+   The preflight is SQL-only: it reports recorded state without opening or hashing
+   every archived file. A normal Download Archive run validates recorded current
+   files in bounded background work and skips them only when their bytes remain
+   valid. Retryable-failures-only mode deliberately does not audit healthy recorded
+   downloads.
+4. Press **Start Download Archive** explicitly.
+5. Use Run Detail to pause, cancel, or resume. Completed files are always retained.
+
+From the CLI, first inspect the same scope without mutating it, then start the run:
+
+```powershell
+.\.venv\Scripts\python.exe -m olis_archive archive-preflight
+.\.venv\Scripts\python.exe -m olis_archive download-archive
+.\.venv\Scripts\python.exe -m olis_archive archive-preflight --session 2014R1
+.\.venv\Scripts\python.exe -m olis_archive download-archive --session 2014R1
+.\.venv\Scripts\python.exe -m olis_archive download-archive --session 2026R1 --kind public_testimony --kind floor_letter
+.\.venv\Scripts\python.exe -m olis_archive download-archive --session 2026R1 --retryable-failures-only
+```
+
+See [docs/historical_backfill.md](docs/historical_backfill.md) for the complete
+workflow and [docs/completeness.md](docs/completeness.md) for session-state meanings.
+
+## Targeted collection and CLI
+
+The Phase 1 tools remain supported for maintenance and debugging:
+
+```powershell
+# Collect one bill, including eligible payloads.
 .\.venv\Scripts\python.exe -m olis_archive collect-bill 2026R1 SB1501
 
-# Collect an explicitly selected session.
+# Collect one explicit session; limit during source validation when useful.
 .\.venv\Scripts\python.exe -m olis_archive collect-session 2026R1
-
-# Limit a session run during validation.
 .\.venv\Scripts\python.exe -m olis_archive collect-session 2026R1 --max-bills 10
 
 # Display a stored bill, sponsors, and documents as JSON.
 .\.venv\Scripts\python.exe -m olis_archive show-bill 2026R1 SB1501
 
-# Retry recoverable document failures associated with an earlier run.
+# Resume one interrupted or low-space-paused run.
+.\.venv\Scripts\python.exe -m olis_archive resume-run 12
+
+# Explicitly retry failed documents from a targeted Phase 1 bill/session run.
 .\.venv\Scripts\python.exe -m olis_archive retry-failures --run-id 12
 
-# Resume the same interrupted or low-space-paused run.
-.\.venv\Scripts\python.exe -m olis_archive resume-run 12
+# Historical bulk retries remain bounded and SQL-backed through Download Archive.
+.\.venv\Scripts\python.exe -m olis_archive download-archive --session 2026R1 --retryable-failures-only
 ```
 
-Use `python -m olis_archive --help` or a command's `--help` for its exact options.
-Collection exits successfully only for `completed`. A `completed_with_errors` run
-prints its complete JSON counters but returns a nonzero shell status so automation
-cannot silently treat a partial archive as complete; inspect Run Detail for its
-durable errors.
+Bulk retryable-only mode excludes terminal failures. To deliberately reattempt a
+terminal validation failure, review and select that record on the **Retry Failures**
+page; it will remain terminal if validation fails again. The targeted Phase 1
+`retry-failures --run-id` command can also include terminal failures from that
+targeted source run, but it intentionally rejects Phase 2 historical bulk run IDs.
 
-## Configuration
-
-Environment values are loaded from `.env` without overriding values already set in
-the process environment. Settings saved through the UI are stored in SQLite and
-overlay the corresponding environment defaults for future runtimes.
-
-| Variable | Default | Purpose |
-| --- | ---: | --- |
-| `LEGIVIEW_ARCHIVE_ROOT` | `data/archive` | Payload archive root; an external dedicated directory is recommended. |
-| `LEGIVIEW_DATABASE_PATH` | `data/legiview.sqlite3` | SQLite database; configured by environment, not the Settings page. |
-| `LEGIVIEW_REQUEST_TIMEOUT` | `30` | OData, OLIS HTML, and download timeout in seconds. |
-| `LEGIVIEW_ODATA_WORKERS` | `1` | Concurrent durable collection workers, from 1 to 4. |
-| `LEGIVIEW_DOWNLOAD_WORKERS` | `2` | Document download workers within a collection, from 1 to 8. |
-| `LEGIVIEW_HTML_CONCURRENCY` | `1` | Concurrent OLIS HTML requests, from 1 to 2. |
-| `LEGIVIEW_MIN_FREE_SPACE_BYTES` | `1073741824` | Free-space floor preserved during downloads. |
-| `LEGIVIEW_INTER_REQUEST_DELAY` | `0.25` | Minimum delay between OData/OLIS HTML requests in seconds. |
-| `LEGIVIEW_HOST` | `127.0.0.1` | Flask bind host. |
-| `LEGIVIEW_PORT` | `5000` | Flask port. |
-| `LEGIVIEW_DEBUG` | `0` | Flask debug flag. Leave disabled for normal use. |
-
-Numeric settings are range-checked. The UI rejects a filesystem root or an existing
-non-directory archive path. Saved settings take effect after LegiView is restarted;
-the current runtime is never hot-swapped because a paused or canceled request can
-still be winding down safely. Run records retain their stored configuration
-snapshots for provenance; queued or resumed work uses the effective settings of the
-runtime that executes it.
+Use `.\.venv\Scripts\python.exe -m olis_archive --help` (or the POSIX equivalent)
+or a subcommand's `--help` for exact options. A
+mutating CLI command creates durable state and holds the same exclusive mutation lock
+as the web app. It returns success only for a clean completed outcome; partial/error
+summaries remain in SQLite and produce a nonzero shell status.
 
 ## Storage and file safety
 
-SQLite stores source metadata, raw source values, settings, logical documents,
-immutable payload versions, collection stages, counters, and durable errors. The
-archive stores document bytes under:
+SQLite stores source metadata and raw values, sync/completeness state, source
+presence, display reconciliation, anomalies, probes, settings, logical documents,
+immutable versions, runs/items/stages, counters, and errors. Payloads use:
 
 ```text
 <archive_root>/<session>/<bill>/<document_kind>/<source_numeric_id>/<filename>
 ```
 
-Only relative archive paths are stored in SQLite. Completed downloads are streamed
-to `.part`, checked for length and file type, hashed with SHA-256, flushed, and
-atomically promoted without overwriting unrelated bytes. A valid completed file is
-revalidated and skipped on an idempotent rerun. See
-[docs/archive_layout.md](docs/archive_layout.md) for identity, versioning, and
-recovery details.
+Only relative archive paths are stored. Downloads use official-host and redirect
+validation, free-space reservations, streaming `.part` files, length/type/signature
+validation, SHA-256, flush, and atomic no-replace promotion. Equal content reuses its
+retained version; changed bytes create `__v0002` and later immutable suffixes. No
+successful source comparison, cancel, retry, or low-space event deletes records or
+previous payloads.
 
-Before serving a registered local file, the UI rechecks its recorded filename, MIME,
-byte count, SHA-256, and path components. Mutating localhost forms also require a
-session-bound CSRF token.
+The archive root must be dedicated to LegiView. A `.legiview-archive-root` marker
+authorizes recursive startup maintenance; empty roots are initialized, recognizable
+legacy LegiView trees are adopted once, and arbitrary nonempty directories are
+rejected without cleanup.
 
-**Every downloaded document is untrusted.** LegiView validates basic format and
-integrity but does not provide antivirus scanning. It never executes downloaded
-PDF, Office, archive, or script content. Keep operating-system security protections
-enabled and assess files before opening them.
+Before serving a registered local file, the UI rechecks its path, filename, type,
+size, and hash. Mutating forms require a session-bound CSRF token.
 
-## Restart, resume, and retry
+**Downloaded files are untrusted.** LegiView never executes them and does not provide
+antivirus scanning, Office automation, OCR, or content extraction. See
+[docs/archive_layout.md](docs/archive_layout.md).
 
-Run state is durable. On startup LegiView:
+## Pause, restart, resume, and retry
 
-1. applies database migrations;
-2. changes records left falsely `running` or `downloading` to recoverable
-   `interrupted` states;
-3. removes incomplete `.part` files only beneath the configured archive root; and
-4. starts web workers and enqueues runs that were already `queued`.
+Run state is durable. Startup verifies the dedicated archive ownership marker,
+normalizes falsely active runs/items/downloads to `interrupted`, removes incomplete
+`.part` files only beneath that owned archive root, and enqueues work that was already
+queued. An interrupted run requires an explicit Resume. Already completed session
+items and valid files are skipped.
 
-An interrupted run is not silently restarted. Resume it from Run Detail or with
-`resume-run`. When the free-space floor pauses a run, restore space and resume the
-same way. Resume re-enters the collection engine, and already valid payloads are
-verified and skipped.
+Pause/cancel stops new historical document claims and retains completed work.
+Duplicate Resume requests cannot multiply work. Retry Failures is a separate explicit
+attempt cycle; terminal validation failures such as the known zero-byte upstream
+testimony are never retried forever automatically.
 
-Use **Retry Failures** or `retry-failures --run-id` to create a separate durable run
-for failed documents from an earlier run. The explicit action can reattempt both
-recoverable and terminal failures; it is the operator's authority to begin a new
-attempt cycle. Valid completed documents are not selected or redownloaded, and a
-failure that persists remains visible for review.
+Historical OLIS display reconciliation pauses the same durable inventory run after
+three consecutive retryable page failures. This circuit breaker limits requests
+during a broader source outage. Once source access is healthy, explicitly resume the
+same run; completed session/entity work is retained.
 
-## Tests
+Every mutating process uses an OS lock beside SQLite. A second writer exits rather
+than racing startup recovery or archive changes. See
+[docs/recovery.md](docs/recovery.md).
 
-The default suite is self-contained and does not require OLIS network access:
+## Browse, status, operations, and exports
+
+The dashboard summarizes historical scope and archive health. **Session Status** at
+`/session-status` gives per-session counts and drill-downs. Consolidated
+**Operations** at `/operations` separates Errors and Anomalies and supplies SQL
+filters. Bill, document, run, session, error, and anomaly lists are paginated for
+historical scale. CSV exports stream rather than materializing the corpus in Python:
+
+- `/exports/sessions.csv` for session inventory;
+- `/exports/documents.csv` for document inventory, honoring Browse Documents filters;
+- `/exports/operations.csv?view=all|errors|anomalies` for operational review.
+
+When probe sizes are incomplete, known remote bytes are labeled a **lower bound**.
+Inventory completeness and payload archive completeness are reported separately.
+
+## Tests and validation
+
+The default automated suite is offline:
 
 ```powershell
 .\.venv\Scripts\python.exe -m pytest -q
 ```
 
-It covers source mapping, parsing fixtures, persistence and idempotency, job states,
-archive-path safety, downloader behavior through a local test server, startup
-recovery, UI routes, and CLI wiring. See
-[docs/phase1_validation.md](docs/phase1_validation.md) for the source-spike evidence
-and live validation record.
+```bash
+.venv/bin/python -m pytest -q
+```
 
-## Phase 1 boundaries
+Live tests are explicitly gated and must follow the acceptable-use agreement. See
+[docs/phase2_validation.md](docs/phase2_validation.md) for automated, controlled-live,
+and whole-history acceptance evidence. Phase 1's original source/run ledger remains
+in [docs/phase1_validation.md](docs/phase1_validation.md).
 
-- Mutating web and CLI processes are single-owner per database and archive. Phase 1
-  uses a cross-process lock rather than distributing work across application
-  processes; concurrent `show-bill` remains read-only safe.
-- Only Oregon `HB` and `SB` measures are collected.
-- Collection is on demand for one bill or one explicitly selected session. There is
-  no multi-year history orchestrator, recurring scheduler, or destructive mirror.
-- Modern submitted testimony uses one narrowly scoped OLIS HTML page because its
-  displayed listing complements OData. There is no generic crawler or browser
-  automation.
-- Committee records classified as other or unknown are retained for context but are
-  not payload-download targets unless stronger source evidence classifies them as
-  testimony or a presentation.
-- There is no OCR, text extraction, full-text/sist2 indexing, semantic or AI analysis,
-  natural-language search, reporting suite, or sponsor-network visualization.
-- There is no built-in antivirus, user authentication, cloud hosting, PostgreSQL,
-  Redis, or Celery.
-- Detection of changed payloads relies primarily on official source modification
-  metadata. Previously retained bytes are never silently replaced.
+## Phase 2 boundaries
+
+LegiView remains a local, single-mutation-owner application. Phase 2 does not add a
+recurring scheduler, sist2 process/index management, OCR, AI/LLM analysis, semantic
+classification, natural-language search, graphs/scoring, an antivirus pipeline,
+PostgreSQL, Redis, Celery, multi-user authentication, cloud hosting, or destructive
+mirroring. The archive remains ordinary files suitable for an external sist2 index.
 
 ## License
 
-LegiView's software code is copyright (C) 2026 Save Oregon Schools, LLC and is
-licensed under the GNU Affero General Public License version 3. See
-[LICENSE](LICENSE) for the full license text.
+LegiView's software code is copyright (C) 2026 Save Oregon Schools, LLC and licensed
+under the GNU Affero General Public License version 3. See [LICENSE](LICENSE).
 
-LegiView is distributed without any warranty; without even the implied warranty
-of merchantability or fitness for a particular purpose.
+LegiView is distributed without any warranty, including the implied warranties of
+merchantability or fitness for a particular purpose.
 
-The Save Oregon Schools name, logo, and related branding are not licensed for
-reuse under the GNU Affero General Public License. See
-[TRADEMARKS.md](TRADEMARKS.md) for the project's trademark and branding notice.
+The Save Oregon Schools name, logo, and related branding are not licensed for reuse
+under the AGPL. See [TRADEMARKS.md](TRADEMARKS.md).

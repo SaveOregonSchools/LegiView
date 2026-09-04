@@ -1,9 +1,15 @@
 # Archive layout and recovery
 
-This document describes the Phase 1 contract between SQLite metadata and archived
-document bytes. Configure a dedicated archive root, normally outside the LegiView
-repository. The root must be a real directory rather than a filesystem root, file,
-link, or reparse-point alias.
+This document describes the contract between SQLite metadata and archived document
+bytes. Phase 2 keeps the proven Phase 1 hierarchy and immutable version model; no
+payload-layout migration is required. The portable default archive is
+`<project_root>/archive`, although a dedicated absolute location can be configured.
+The root must be a dedicated real directory rather than a broad personal/shared
+directory, filesystem root, file, link, or reparse-point alias. LegiView records this
+contract in `.legiview-archive-root`. On the first upgraded startup it can adopt a
+marker-less archive only when the entire existing tree has the exact legacy layout
+described below and contains at least one regular payload as positive evidence;
+unrelated or empty lookalike directory trees are rejected without cleanup.
 
 Phase 1 enforces exclusive mutation ownership with an operating-system lock file next
 to SQLite. A second web server or mutating CLI command against the same database is
@@ -25,6 +31,7 @@ Every in-scope payload has this directory shape:
 
 ```text
 <archive_root>/
+  .legiview-archive-root
   <official_session_key>/
     <compact_bill_id>/
       <document_kind>/
@@ -32,7 +39,7 @@ Every in-scope payload has this directory shape:
           <sanitized_filename>
 ```
 
-Examples:
+Examples (the drive-letter root is only an illustration; stored paths are portable):
 
 ```text
 C:\LegiViewArchive\2026R1\SB1501\public_testimony\244133\Testimony.pdf
@@ -50,9 +57,15 @@ session + bill + source entity type + source document ID
 
 The normalized document kinds are `public_testimony`, `legacy_testimony`,
 `committee_presentation`, `floor_letter`, `committee_document_other`, and `unknown`.
-Phase 1 downloads the first four when an official download URL exists. Other and
+The first four are ordinarily downloadable when an official URL exists. Other and
 unknown committee documents remain browseable metadata with `not_applicable` download
-state unless stronger source evidence permits reclassification.
+state unless stronger source evidence permits reclassification. Unknown raw values
+are retained and diagnosed rather than discarded.
+
+Inventory Backfill creates and reconciles these logical records without fetching the
+payloads. Download Archive is an explicit later operation over the durable inventory.
+Its session/kind/status filters and an inventory cutoff are frozen at run creation, so
+documents discovered by a concurrent later inventory cannot silently expand the run.
 
 ## Filenames and registered paths
 
@@ -121,7 +134,14 @@ Redirect targets are checked again. A transfer:
 Retryable HTTP and network failures use bounded backoff and honor `Retry-After`.
 Validation failures, redirects outside the allowlist, and destination conflicts are
 recorded rather than forced through. Low free space sets the document to
-`paused_low_space` and pauses its durable run.
+`paused_low_space` and pauses its durable run. The user-facing floor is configured in
+GB, where one LegiView GB is `1024 ** 3` bytes; reservations and checks continue in
+bytes internally.
+
+At historical scale, eligible rows are claimed atomically from SQLite in bounded
+batches rather than loaded into one Python queue. A claim creates or updates the
+durable document run item. Pause/cancel stops new claims, concurrent workers cannot
+win the same row, and the existing validation/version rules still govern promotion.
 
 ## Restart and `.part` recovery
 
@@ -132,8 +152,14 @@ and mutating CLI commands:
 
 1. changes `running` collection runs and items to `interrupted`;
 2. changes `downloading` documents and versions to `interrupted`; and
-3. removes incomplete `.part` files beneath the one explicitly configured archive
-   root without following directory links.
+3. verifies the archive ownership marker; and
+4. removes incomplete `.part` files beneath that one explicitly configured,
+   dedicated archive root without following directory links.
+
+Recursive `.part` cleanup refuses to run when the marker is absent or invalid. The
+normal locked startup creates the marker for an empty root or safely recognizes and
+adopts an older LegiView-only tree first. It never treats an arbitrary nonempty
+directory as an archive merely because it was entered in Settings.
 
 A `.part` file alone is not a trusted completion marker, so normal startup discards
 it and leaves the associated logical document eligible for an explicit retry. Queued
@@ -145,15 +171,22 @@ require **Resume** in the UI or:
 ```
 
 Failed documents associated with an earlier run can instead be explicitly retried in
-a new run, including a terminal failure the operator deliberately chooses to
-reattempt:
+a new run. A selected Retry Failures action (or the targeted Phase 1 command) can
+deliberately reattempt a terminal failure:
 
 ```powershell
-.\.venv\Scripts\python.exe -m olis_archive retry-failures --run-id <source-run-id>
+.\.venv\Scripts\python.exe -m olis_archive retry-failures --run-id <targeted-source-run-id>
+.\.venv\Scripts\python.exe -m olis_archive download-archive --session <session-key> --retryable-failures-only
 ```
 
-Because valid completed files are revalidated and skipped, either path can safely
-repeat discovery without duplicating logical rows or known payloads.
+The historical bulk command includes only retryable failures; it excludes terminal
+validation failures. A normal Download Archive run audits recorded current files in
+bounded background work, while retryable-failures-only mode intentionally avoids
+auditing healthy downloads. Equal valid bytes still reuse the known version, so an
+explicit retry does not duplicate logical rows or payload versions.
+
+See [recovery.md](recovery.md) for historical-run pause, claim, cancel, restart, and
+operator-recovery semantics.
 
 ## Backup and trust boundary
 
@@ -163,5 +196,6 @@ run provenance. LegiView does not delete remote-source records merely because a 
 query omits them, and it is not a destructive mirror.
 
 Archived files remain untrusted even after type and hash validation. LegiView does
-not execute them and provides no antivirus scanning, OCR, or content extraction in
-Phase 1.
+not execute them and provides no antivirus scanning, OCR, or content extraction.
+Ordinary files remain directly readable by external tools such as sist2, but LegiView
+does not manage a sist2 process or index in Phase 2.

@@ -14,6 +14,22 @@ from typing import Any, Mapping
 _BILL_RE = re.compile(r"^\s*(HB|SB)\s*[- ]?\s*(\d{1,6})\s*$", re.IGNORECASE)
 POSITION_MAP = {3981: "Neutral", 3982: "Oppose", 3983: "Support"}
 
+# These are the committee-document values observed during the Phase 1 source
+# spike.  Keeping the catalogue deliberately narrow is important: a new value
+# is still archived as a committee document, but is also distinguishable from
+# a value whose meaning LegiView has actually verified.
+KNOWN_COMMITTEE_PRESENTATION_TYPES = frozenset({"presentation"})
+KNOWN_OTHER_COMMITTEE_DOCUMENT_TYPES = frozenset(
+    {
+        "witness registration",
+        "meeting material",
+        "preliminary sms",
+        "revenue impact statement",
+        "fiscal impact statement",
+        "budget report",
+    }
+)
+
 
 class InvalidBillId(ValueError):
     pass
@@ -58,6 +74,16 @@ class SponsorMapping:
     known: bool
 
 
+@dataclass(frozen=True, slots=True)
+class CommitteeDocumentClassification:
+    """Conservative classification plus whether the raw value is understood."""
+
+    kind: str
+    method: str
+    known: bool
+    raw_value: str | None
+
+
 def map_sponsor(raw: Mapping[str, Any]) -> SponsorMapping:
     sponsor_type = str(raw.get("SponsorType") or "").strip()
     level = str(raw.get("SponsorLevel") or "").strip()
@@ -81,16 +107,36 @@ def testimony_position(value: Any) -> str | None:
     return POSITION_MAP.get(numeric, f"Unknown ({numeric})")
 
 
+def classify_committee_document_detail(document_type: Any) -> CommitteeDocumentClassification:
+    """Classify a raw type without silently treating future values as known.
+
+    Unknown non-empty values remain ordinary, retained committee metadata.  The
+    ``known`` bit gives the historical reconciler a durable diagnostic hook; it
+    does not turn an unexpected value into a fatal exception or discard it.
+    """
+
+    raw_value = _text(document_type)
+    normalized = (raw_value or "").casefold()
+    if normalized in KNOWN_COMMITTEE_PRESENTATION_TYPES:
+        return CommitteeDocumentClassification(
+            "committee_presentation", "raw_document_type", True, raw_value
+        )
+    if normalized in KNOWN_OTHER_COMMITTEE_DOCUMENT_TYPES:
+        return CommitteeDocumentClassification(
+            "committee_document_other", "raw_document_type", True, raw_value
+        )
+    if raw_value:
+        return CommitteeDocumentClassification(
+            "committee_document_other", "unrecognized_raw_document_type", False, raw_value
+        )
+    return CommitteeDocumentClassification("unknown", "unclassified", False, None)
+
+
 def classify_committee_document(document_type: Any) -> tuple[str, str]:
-    """Return (kind, method) without guessing testimony from a title/filename."""
-    raw = str(document_type or "").strip().casefold()
-    if raw == "presentation":
-        return "committee_presentation", "raw_document_type"
-    if raw in {"testimony", "public testimony", "written testimony"}:
-        return "legacy_testimony", "raw_document_type"
-    if raw:
-        return "committee_document_other", "raw_document_type"
-    return "unknown", "unclassified"
+    """Backward-compatible ``(kind, method)`` view of the detailed mapping."""
+
+    classification = classify_committee_document_detail(document_type)
+    return classification.kind, classification.method
 
 
 def map_measure(raw: Mapping[str, Any]) -> dict[str, Any]:
@@ -152,4 +198,3 @@ def _bool_int(value: Any) -> int | None:
     if lowered in {"false", "0", "no"}:
         return 0
     return None
-

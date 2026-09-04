@@ -5,9 +5,11 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
 import threading
+from urllib.error import HTTPError
 
 import pytest
 
+from olis_archive.services.archive_paths import UnsafeArchivePath, ensure_archive_root_owned
 from olis_archive.services.downloads import (
     ContentLengthMismatch,
     DestinationConflict,
@@ -27,6 +29,33 @@ from olis_archive.services.recovery import (
 
 
 PDF_BYTES = b"%PDF-1.4\n1 0 obj<</Type/Catalog>>endobj\ntrailer<</Root 1 0 R>>\n%%EOF\n"
+
+
+class FakeHTTPResponse:
+    def __init__(self, url: str):
+        self._url = url
+        self.status = 200
+        self.headers = {"Content-Type": "application/pdf"}
+        self.closed = False
+
+    def geturl(self):
+        return self._url
+
+    def close(self):
+        self.closed = True
+
+
+class RecordingOpener:
+    def __init__(self, outcomes):
+        self.outcomes = list(outcomes)
+        self.requests = []
+
+    def open(self, request, timeout):
+        self.requests.append((request, timeout))
+        outcome = self.outcomes.pop(0)
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome
 
 
 @pytest.fixture
@@ -203,6 +232,79 @@ def test_redirect_to_non_allowlisted_host_is_blocked(download_server, tmp_path: 
     assert counters == {"/bad-redirect": 1}
 
 
+def test_auto_followed_redirect_response_is_rejected_and_closed():
+    source = "https://olis.oregonlegislature.gov/liz/2026R1/Downloads/FloorLetter/4701"
+    response = FakeHTTPResponse("https://example.com/stolen")
+    client = SafeHTTPClient(
+        allowed_hosts={"olis.oregonlegislature.gov"},
+        resolver=lambda *_args, **_kwargs: [
+            (None, None, None, None, ("8.8.8.8", 443))
+        ],
+        opener=RecordingOpener([response]),
+    )
+
+    with pytest.raises(UnsafeDownloadTarget):
+        with client.open_stream(source):
+            pytest.fail("unexpected auto-follow response was exposed")
+
+    assert response.closed
+
+
+def test_sensitive_headers_are_removed_on_same_host_port_redirect():
+    source = "http://example.com:8080/start"
+    target = "http://example.com:8081/final"
+    response = FakeHTTPResponse(target)
+    opener = RecordingOpener(
+        [HTTPError(source, 302, "redirect", {"Location": target}, None), response]
+    )
+    client = SafeHTTPClient(
+        allowed_hosts={"example.com"},
+        resolver=lambda *_args, **_kwargs: [
+            (None, None, None, None, ("8.8.8.8", 80))
+        ],
+        opener=opener,
+    )
+
+    with client.open_stream(
+        source,
+        headers={"Authorization": "Bearer secret", "Cookie": "session=secret"},
+    ):
+        pass
+
+    first_request = opener.requests[0][0]
+    second_request = opener.requests[1][0]
+    assert first_request.get_header("Authorization") == "Bearer secret"
+    assert first_request.get_header("Cookie") == "session=secret"
+    assert second_request.get_header("Authorization") is None
+    assert second_request.get_header("Cookie") is None
+    assert response.closed
+
+
+def test_https_downgrade_is_blocked_on_every_redirect_hop():
+    source = "http://example.com/start"
+    upgraded = "https://example.com/secure"
+    downgraded = "http://example.com/downgraded"
+    opener = RecordingOpener(
+        [
+            HTTPError(source, 302, "redirect", {"Location": upgraded}, None),
+            HTTPError(upgraded, 302, "redirect", {"Location": downgraded}, None),
+        ]
+    )
+    client = SafeHTTPClient(
+        allowed_hosts={"example.com"},
+        resolver=lambda *_args, **_kwargs: [
+            (None, None, None, None, ("8.8.8.8", 443))
+        ],
+        opener=opener,
+    )
+
+    with pytest.raises(UnsafeDownloadTarget, match="HTTPS-to-HTTP"):
+        with client.open_stream(source):
+            pytest.fail("downgraded response was exposed")
+
+    assert [request.full_url for request, _timeout in opener.requests] == [source, upgraded]
+
+
 def test_interrupted_response_is_retryable_and_part_is_removed(download_server, tmp_path: Path):
     base_url, _counters = download_server
     with pytest.raises(ContentLengthMismatch) as raised:
@@ -316,7 +418,7 @@ def test_completed_file_is_skipped_only_after_local_validation(download_server, 
     assert counters["/file"] == 1
 
 
-def test_existing_destination_requires_allowed_source_and_stored_hash(
+def test_existing_destination_without_stored_hash_is_redownloaded_and_compared(
     download_server,
     tmp_path: Path,
 ):
@@ -333,17 +435,63 @@ def test_existing_destination_requires_allowed_source_and_stored_hash(
             expected_sha256=sha256(PDF_BYTES).hexdigest(),
         )
 
-    with pytest.raises(DestinationConflict, match="no stored SHA-256"):
-        downloader.download_to_path(
+    recovered = downloader.download_to_path(
+        f"{base_url}/file",
+        destination,
+        archive_root=tmp_path,
+        expected_mime_type="application/pdf",
+        expected_length=len(PDF_BYTES),
+    )
+
+    assert recovered.skipped
+    assert recovered.sha256 == sha256(PDF_BYTES).hexdigest()
+    assert counters == {"/file": 1}
+    assert destination.read_bytes() == PDF_BYTES
+    assert not list(tmp_path.rglob("*.part"))
+
+
+def test_orphaned_destination_with_different_bytes_is_never_overwritten(
+    download_server,
+    tmp_path: Path,
+):
+    base_url, counters = download_server
+    destination = tmp_path / "preplaced.pdf"
+    destination.write_bytes(PDF_BYTES + b"different")
+
+    with pytest.raises(DestinationConflict, match="different bytes"):
+        _downloader().download_to_path(
             f"{base_url}/file",
             destination,
             archive_root=tmp_path,
             expected_mime_type="application/pdf",
-            expected_length=len(PDF_BYTES),
         )
 
-    assert counters == {}
-    assert destination.read_bytes() == PDF_BYTES
+    assert counters == {"/file": 1}
+    assert destination.read_bytes() == PDF_BYTES + b"different"
+    assert not list(tmp_path.rglob("*.part"))
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://user@example.com/file.pdf",
+        "https://example.com:8443/file.pdf",
+        "https://example.com/a/%2e%2e/file.pdf",
+        "http://example.com/file.pdf",
+    ],
+)
+def test_official_origin_policy_rejects_noncanonical_targets(url):
+    client = SafeHTTPClient(
+        allowed_hosts={"example.com"},
+        require_https=True,
+        allowed_ports={443},
+        resolver=lambda *_args, **_kwargs: [
+            (None, None, None, None, ("203.0.113.10", 443))
+        ],
+    )
+
+    with pytest.raises(UnsafeDownloadTarget):
+        client.validate_target(url)
 
 
 def test_low_space_floor_stops_before_part_creation(download_server, tmp_path: Path, monkeypatch):
@@ -434,6 +582,7 @@ def test_recovery_adopts_only_provably_complete_part_and_discards_partial(tmp_pa
 
 
 def test_stale_part_cleanup_stays_within_archive_and_can_preserve_active_parts(tmp_path: Path):
+    ensure_archive_root_owned(tmp_path)
     stale = tmp_path / "one.pdf.part"
     active = tmp_path / "two.pdf.part"
     stale.write_bytes(b"stale")
@@ -444,6 +593,16 @@ def test_stale_part_cleanup_stays_within_archive_and_can_preserve_active_parts(t
     assert removed == ["one.pdf.part"]
     assert not stale.exists()
     assert active.exists()
+
+
+def test_stale_part_cleanup_requires_archive_ownership_marker(tmp_path: Path):
+    unrelated = tmp_path / "unrelated.part"
+    unrelated.write_bytes(b"personal")
+
+    with pytest.raises(UnsafeArchivePath, match="ownership marker"):
+        cleanup_stale_parts(tmp_path)
+
+    assert unrelated.read_bytes() == b"personal"
 
 
 def test_recovery_unlinks_a_part_symlink_without_touching_its_target(tmp_path: Path):

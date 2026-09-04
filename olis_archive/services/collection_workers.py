@@ -1,4 +1,4 @@
-"""Bounded in-process workers whose queue contains only durable run IDs."""
+"""Single-run dispatcher whose queue contains only durable run IDs."""
 
 from __future__ import annotations
 
@@ -14,9 +14,17 @@ LOGGER = logging.getLogger(__name__)
 
 
 class CollectionWorkerManager:
-    def __init__(self, service: CollectionService, *, worker_count: int = 1) -> None:
+    """Dispatch one durable run at a time.
+
+    Each run remains subject to its configured OData, HTML, and download limits;
+    dependency-ordered work may use fewer workers.  Keeping the outer dispatcher
+    singular prevents separately queued runs from multiplying those limits or
+    racing one another for the same document state.
+    """
+
+    def __init__(self, service: CollectionService) -> None:
         self.service = service
-        self.worker_count = max(1, min(int(worker_count), 4))
+        self.worker_count = 1
         self._queue: queue.Queue[int | None] = queue.Queue()
         self._pending: set[int] = set()
         self._active: set[int] = set()
@@ -140,10 +148,21 @@ class CollectionWorkerManager:
             if run_id is None:
                 self._queue.task_done()
                 return
-            with self._lock:
-                self._active.add(run_id)
             try:
-                self.service.execute_run(run_id)
+                with self._lock:
+                    should_run = not self._stopping
+                    if should_run:
+                        # Claim while holding the same gate used by stop().  Once
+                        # stop observes an active ID, its durable row is already
+                        # running and startup normalization can interrupt it;
+                        # otherwise stop wins and this queued run is never begun.
+                        should_run = self.service.runs.claim_run(run_id)
+                    if should_run:
+                        self._active.add(run_id)
+                    else:
+                        self._pending.discard(run_id)
+                if should_run:
+                    self.service.execute_run(run_id, _already_claimed=True)
             except BaseException:
                 # execute_run normally persists exceptions itself; this guard keeps
                 # a daemon alive even if the guardrail itself encounters a bug.

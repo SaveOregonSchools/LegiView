@@ -11,7 +11,10 @@ from bs4 import BeautifulSoup
 from olis_archive import create_app
 from olis_archive import __main__ as cli
 from olis_archive.config import AppConfig
+from olis_archive.database import Database
 from olis_archive.runtime import InstanceAlreadyRunning, build_runtime
+from olis_archive.services.archive_paths import ARCHIVE_OWNERSHIP_MARKER, UnsafeArchivePath
+from olis_archive.services.odata import ODataError
 
 
 PDF_BYTES = b"%PDF-1.4\n1 0 obj<</Type/Catalog>>endobj\ntrailer<</Root 1 0 R>>\n%%EOF\n"
@@ -25,6 +28,7 @@ def web_app(tmp_path: Path):
         {
             "TESTING": True,
             "START_WORKER": False,
+            "PROJECT_ROOT": tmp_path,
             "DATABASE_PATH": database_path,
             "ARCHIVE_ROOT": archive_root,
             "MINIMUM_FREE_SPACE_BYTES": 0,
@@ -99,13 +103,87 @@ def test_app_factory_uses_isolated_paths_and_does_not_start_workers(web_app, tmp
     assert runtime.config.database_path == tmp_path / "data" / "legiview.sqlite3"
     assert runtime.config.archive_root == tmp_path / "archive"
     assert runtime.config.archive_root.is_dir()
-    assert runtime.database.schema_version() == 1
+    assert runtime.database.schema_version() == 5
     assert extension["workers"].snapshot() == {
         "workers": 0,
         "queued": 0,
         "active": 0,
         "alive": 0,
     }
+
+
+def test_app_rejects_untrusted_host_headers(web_app):
+    client = web_app.test_client()
+
+    assert client.get("/health", headers={"Host": "localhost:5000"}).status_code == 200
+    assert client.get("/health", headers={"Host": "127.0.0.1:5000"}).status_code == 200
+    assert client.get("/health", headers={"Host": "[::1]:5000"}).status_code == 200
+    assert client.get("/health", headers={"Host": "attacker.example"}).status_code == 400
+
+
+def test_app_factory_keeps_run_dispatcher_single_with_larger_configured_limits(
+    tmp_path: Path,
+):
+    app = create_app(
+        {
+            "TESTING": True,
+            "START_WORKER": False,
+            "DATABASE_PATH": tmp_path / "data" / "legiview.sqlite3",
+            "ARCHIVE_ROOT": tmp_path / "archive",
+            "MINIMUM_FREE_SPACE_BYTES": 0,
+            "INTER_REQUEST_DELAY": 0,
+            "ODATA_WORKER_COUNT": 4,
+            "DOWNLOAD_WORKER_COUNT": 8,
+            "HTML_REQUEST_CONCURRENCY": 2,
+        }
+    )
+    try:
+        extension = app.extensions["legiview"]
+        runtime = extension["runtime"]
+        assert runtime.config.odata_worker_count == 4
+        assert runtime.config.download_worker_count == 8
+        assert runtime.config.html_request_concurrency == 2
+        assert extension["workers"].worker_count == 1
+    finally:
+        assert app.extensions["legiview"]["shutdown"]()
+
+
+def test_app_factory_database_override_never_opens_environment_database(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    environment_root = tmp_path / "environment-root"
+    environment_database = environment_root / "data" / "would-be-production.sqlite3"
+    override_database = tmp_path / "isolated" / "test.sqlite3"
+    override_archive = tmp_path / "isolated-archive"
+    monkeypatch.setenv("LEGIVIEW_PROJECT_ROOT", str(environment_root))
+    monkeypatch.setenv("LEGIVIEW_DATABASE_PATH", "data/would-be-production.sqlite3")
+    monkeypatch.setenv("LEGIVIEW_ARCHIVE_ROOT", "environment-archive")
+
+    app = create_app(
+        {
+            "TESTING": True,
+            "START_WORKER": False,
+            "DATABASE_PATH": override_database,
+            "ARCHIVE_ROOT": override_archive,
+            "MINIMUM_FREE_SPACE_BYTES": 0,
+            "INTER_REQUEST_DELAY": 0,
+        }
+    )
+    try:
+        runtime = app.extensions["legiview"]["runtime"]
+        run_id = runtime.collection.runs.create_run(
+            "collect_bill",
+            session_key="2026R1",
+            bill_id_compact="SB1501",
+        )
+
+        assert runtime.config.database_path == override_database.resolve()
+        assert runtime.config.database_path_configured == str(override_database.resolve())
+        assert runtime.collection.runs.get_run(run_id)["requested_bill_id_compact"] == "SB1501"
+        assert override_database.is_file()
+        assert not environment_database.exists()
+    finally:
+        assert app.extensions["legiview"]["shutdown"]()
 
 
 @pytest.mark.parametrize(
@@ -241,6 +319,60 @@ def test_valid_csrf_forms_allow_session_cancel_resume_retry_and_settings(web_app
     saved = client.post("/settings", data={"_csrf_token": token})
     assert saved.status_code == 303
     assert saved.headers["Location"].endswith("/settings")
+
+
+def test_settings_save_relative_archive_portably_and_use_gb_floor(web_app):
+    runtime = web_app.extensions["legiview"]["runtime"]
+    client = web_app.test_client()
+    token = _get_csrf_token(client, "/settings")
+    page = client.get("/settings")
+    html = page.get_data(as_text=True)
+    assert "Minimum free-space floor (GB)" in html
+    assert "Project root" in html
+    assert str(runtime.config.project_root) in html
+    assert str(runtime.config.database_path) in html
+
+    proposed_archive = runtime.config.project_root / "storage" / "archive"
+    assert not proposed_archive.exists()
+    response = client.post(
+        "/settings",
+        data={
+            "_csrf_token": token,
+            "archive_root": "storage/archive",
+            "minimum_free_space_gb": "7.5",
+        },
+    )
+
+    assert response.status_code == 303
+    assert runtime.storage.get_setting("archive_root") == "storage/archive"
+    assert runtime.storage.get_setting("minimum_free_space_gb") == 7.5
+    effective = runtime.config.with_settings(runtime.storage.get_settings())
+    assert effective.archive_root_configured == "storage/archive"
+    assert effective.archive_root == runtime.config.project_root / "storage" / "archive"
+    assert effective.minimum_free_space_gb == 7.5
+    assert effective.minimum_free_space_bytes == int(7.5 * 1024**3)
+    assert not proposed_archive.exists()
+
+
+def test_settings_reject_nonempty_unowned_archive_without_mutating_it(web_app):
+    runtime = web_app.extensions["legiview"]["runtime"]
+    unowned = runtime.config.project_root / "Documents"
+    unowned.mkdir()
+    unrelated = unowned / "unrelated.part"
+    unrelated.write_bytes(b"personal")
+    client = web_app.test_client()
+    token = _get_csrf_token(client, "/settings")
+
+    response = client.post(
+        "/settings",
+        data={"_csrf_token": token, "archive_root": "Documents"},
+    )
+
+    assert response.status_code == 200
+    assert "not owned by LegiView" in response.get_data(as_text=True)
+    assert runtime.storage.get_setting("archive_root") is None
+    assert unrelated.read_bytes() == b"personal"
+    assert not (unowned / ARCHIVE_OWNERSHIP_MARKER).exists()
 
 
 def test_detail_pages_and_registered_file_route_are_wired(web_app):
@@ -530,6 +662,147 @@ def test_cli_exit_status_distinguishes_clean_and_partial_runs(status, expected_e
     assert json.loads(capsys.readouterr().out)["status"] == status
 
 
+def test_legacy_retry_snapshot_rejects_historical_bulk_runs(web_app):
+    runtime = web_app.extensions["legiview"]["runtime"]
+    _seed_bill(runtime)
+    source_run = runtime.collection.runs.create_run(
+        "inventory_backfill",
+        session_keys=["2026R1"],
+        scope={"session_keys": ["2026R1"]},
+    )
+
+    with pytest.raises(ValueError, match="Historical archive retries"):
+        runtime.collection.create_retry_failures_run(source_run)
+
+
+def test_download_archive_cli_prints_preflight_and_lower_bound_warning(
+    monkeypatch, capsys
+):
+    class FakePreflight:
+        known_bytes_fit = True
+        unknown_size_pending = 2
+
+        @staticmethod
+        def as_dict():
+            return {"documents_in_scope": 3, "unknown_size_pending": 2}
+
+    class FakeRuns:
+        @staticmethod
+        def get_run(run_id):
+            return {"id": run_id, "status": "completed"}
+
+    class FakeCollection:
+        runs = FakeRuns()
+
+        @staticmethod
+        def download_archive_preflight(*_args, **_kwargs):
+            return FakePreflight()
+
+        @staticmethod
+        def create_download_archive_run(*_args, **_kwargs):
+            return 91
+
+        @staticmethod
+        def execute_run(_run_id):
+            return "completed"
+
+    monkeypatch.setattr(
+        cli,
+        "build_runtime",
+        lambda *args, **kwargs: SimpleNamespace(collection=FakeCollection()),
+    )
+
+    assert cli.main(["download-archive", "--session", "2026R1"]) == 0
+    captured = capsys.readouterr()
+    assert "Download Archive preflight" in captured.err
+    assert "lower bound" in captured.err
+    assert json.loads(captured.out)["run_id"] == 91
+
+
+@pytest.mark.parametrize("command", ["archive-preflight", "download-archive"])
+def test_download_archive_cli_rejects_uninventoried_explicit_scope(
+    command, monkeypatch, capsys
+):
+    class FakeCollection:
+        @staticmethod
+        def download_archive_preflight(*_args, **_kwargs):
+            raise ValueError(
+                "Session selection has not been inventoried: 2026R1"
+            )
+
+    monkeypatch.setattr(
+        cli,
+        "build_runtime",
+        lambda *args, **kwargs: SimpleNamespace(collection=FakeCollection()),
+    )
+
+    assert cli.main([command, "--session", "2026R1"]) == 2
+    captured = capsys.readouterr()
+    assert "has not been inventoried: 2026R1" in captured.err
+    assert captured.out == ""
+
+
+def test_whole_history_cli_prints_acceptable_use_window_reminder(monkeypatch, capsys):
+    class FakeRuns:
+        @staticmethod
+        def get_run(run_id):
+            return {"id": run_id, "status": "completed"}
+
+    class FakeCollection:
+        runs = FakeRuns()
+
+        @staticmethod
+        def create_inventory_backfill_run(*_args, **_kwargs):
+            return 92
+
+        @staticmethod
+        def execute_run(_run_id):
+            return "completed"
+
+    monkeypatch.setattr(
+        cli,
+        "build_runtime",
+        lambda *args, **kwargs: SimpleNamespace(collection=FakeCollection()),
+    )
+
+    assert cli.main(["inventory-backfill"]) == 0
+    captured = capsys.readouterr()
+    assert "5:00 p.m.–6:00 a.m. Pacific" in captured.err
+    assert "once per day" in captured.err
+
+
+@pytest.mark.parametrize(
+    "creation_error",
+    [
+        ValueError("Selected sessions are outside the resolved historical scope: 2099R1"),
+        ODataError(
+            "OData session discovery failed",
+            url="https://api.oregonlegislature.gov/odata/odataservice.svc/LegislativeSessions",
+            retryable=True,
+        ),
+    ],
+)
+def test_inventory_backfill_cli_reports_creation_errors_cleanly(
+    creation_error, monkeypatch, capsys
+):
+    class FakeCollection:
+        @staticmethod
+        def create_inventory_backfill_run(*_args, **_kwargs):
+            raise creation_error
+
+    monkeypatch.setattr(
+        cli,
+        "build_runtime",
+        lambda *args, **kwargs: SimpleNamespace(collection=FakeCollection()),
+    )
+
+    assert cli.main(["inventory-backfill", "--session", "2099R1"]) == 2
+    captured = capsys.readouterr()
+    assert "Inventory Backfill could not be created" in captured.err
+    assert str(creation_error) in captured.err
+    assert captured.out == ""
+
+
 def test_startup_normalizes_active_states_and_removes_parts(tmp_path: Path):
     config = AppConfig(
         database_path=tmp_path / "recovery.sqlite3",
@@ -537,7 +810,13 @@ def test_startup_normalizes_active_states_and_removes_parts(tmp_path: Path):
         minimum_free_space_bytes=0,
         inter_request_delay=0,
     )
-    first = build_runtime(config, normalize_interrupted=False, clean_parts=False)
+    first = build_runtime(
+        config,
+        normalize_interrupted=False,
+        clean_parts=False,
+        exclusive=True,
+    )
+    assert (config.archive_root / ARCHIVE_OWNERSHIP_MARKER).is_file()
     bill_id = _seed_bill(first)
     document_id = _seed_document(first, bill_id, "244133", "Interrupted testimony")
     running_id = first.collection.create_collect_bill_run("2026R1", "SB1501")
@@ -553,6 +832,8 @@ def test_startup_normalizes_active_states_and_removes_parts(tmp_path: Path):
     staged = config.archive_root / "2026R1" / "SB1501" / "public_testimony" / "244133" / "Evidence.pdf.part"
     staged.parent.mkdir(parents=True)
     staged.write_bytes(PDF_BYTES[:20])
+    assert first.instance_lock is not None
+    first.instance_lock.close()
 
     recovered = build_runtime(config)
 
@@ -565,7 +846,44 @@ def test_startup_normalizes_active_states_and_removes_parts(tmp_path: Path):
     assert not staged.exists()
 
 
-def test_exclusive_runtime_lock_blocks_a_second_mutator_but_allows_read_only(tmp_path: Path):
+def test_startup_rejects_unowned_nonempty_root_without_removing_parts(tmp_path: Path):
+    archive = tmp_path / "Documents"
+    archive.mkdir()
+    unrelated = archive / "unrelated.part"
+    unrelated.write_bytes(b"must survive")
+    config = AppConfig(
+        database_path=tmp_path / "unowned.sqlite3",
+        archive_root=archive,
+        minimum_free_space_bytes=0,
+        inter_request_delay=0,
+    )
+
+    with pytest.raises(UnsafeArchivePath, match="not owned by LegiView"):
+        build_runtime(config)
+
+    assert unrelated.read_bytes() == b"must survive"
+    assert not (archive / ARCHIVE_OWNERSHIP_MARKER).exists()
+
+
+def test_read_only_runtime_does_not_create_archive_or_ownership_marker(tmp_path: Path):
+    database_path = tmp_path / "readonly.sqlite3"
+    Database(database_path).initialize()
+    archive = tmp_path / "not-created"
+    config = AppConfig(
+        database_path=database_path,
+        archive_root=archive,
+        minimum_free_space_bytes=0,
+        inter_request_delay=0,
+    )
+
+    build_runtime(config, normalize_interrupted=False, clean_parts=False)
+
+    assert not archive.exists()
+
+
+def test_exclusive_runtime_lock_blocks_a_second_mutator_but_allows_read_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
     config = AppConfig(
         database_path=tmp_path / "locked.sqlite3",
         archive_root=tmp_path / "archive",
@@ -579,6 +897,14 @@ def test_exclusive_runtime_lock_blocks_a_second_mutator_but_allows_read_only(tmp
         exclusive=True,
     )
     try:
+        initialize_calls: list[str] = []
+        original_initialize = Database.initialize
+
+        def tracked_initialize(database: Database) -> int:
+            initialize_calls.append(database.path)
+            return original_initialize(database)
+
+        monkeypatch.setattr(Database, "initialize", tracked_initialize)
         with pytest.raises(InstanceAlreadyRunning, match="Another LegiView process"):
             build_runtime(
                 config,
@@ -586,6 +912,7 @@ def test_exclusive_runtime_lock_blocks_a_second_mutator_but_allows_read_only(tmp
                 clean_parts=False,
                 exclusive=True,
             )
+        assert initialize_calls == []
 
         reader = build_runtime(
             config,
@@ -593,7 +920,20 @@ def test_exclusive_runtime_lock_blocks_a_second_mutator_but_allows_read_only(tmp
             clean_parts=False,
             exclusive=False,
         )
-        assert reader.database.schema_version() == 1
+        assert initialize_calls == []
+        assert reader.database.schema_version() == 5
+
+        monkeypatch.setattr(
+            Database, "migration_manifest_is_current", lambda _database: False
+        )
+        with pytest.raises(InstanceAlreadyRunning, match="Another LegiView process"):
+            build_runtime(
+                config,
+                normalize_interrupted=False,
+                clean_parts=False,
+                exclusive=False,
+            )
+        assert initialize_calls == []
     finally:
         assert owner.instance_lock is not None
         owner.instance_lock.close()

@@ -10,6 +10,7 @@ from olis_archive.config import AppConfig
 from olis_archive.services.collection import CollectionService
 from olis_archive.database import Database
 from olis_archive.runtime import build_runtime
+from olis_archive.services.archive_paths import ARCHIVE_OWNERSHIP_MARKER
 from olis_archive.services.downloads import DownloadError, DownloadResult, LowDiskSpace
 from olis_archive.services.file_types import FileTypeDetection, FileValidation
 from olis_archive.services.olis_http import HTMLResponse
@@ -337,7 +338,11 @@ def test_collect_bill_is_durable_idempotent_and_retries_only_failed_payloads(
     assert first_header["documents_downloaded"] == 4
     assert first_header["documents_failed"] == 1
 
-    stages = {item["stage"] for item in service.runs.run_items(first_run) if item["item_type"] == "stage"}
+    first_run_items = service.runs.run_items(first_run)
+    assert {item["session_key"] for item in first_run_items} == {"2026R1"}
+    stages = {
+        item["stage"] for item in first_run_items if item["item_type"] == "stage"
+    }
     assert {
         "load_session",
         "load_reference_data",
@@ -526,6 +531,7 @@ def test_startup_normalizes_active_work_and_removes_blocking_part(tmp_path: Path
 
     restarted = build_runtime(config=config)
     assert not part.exists()
+    assert (config.archive_root / ARCHIVE_OWNERSHIP_MARKER).is_file()
     assert restarted.collection.runs.get_run(run_id)["status"] == "interrupted"
     assert restarted.storage.get_document(document_id)["download_status"] == "interrupted"
     assert restarted.collection.runs.requeue(run_id)
@@ -650,6 +656,9 @@ def test_collect_session_loads_reference_data_once_and_honors_max_bills(
     stage_items = [
         item for item in service.runs.run_items(run_id) if item["item_type"] == "stage"
     ]
+    assert {
+        item["session_key"] for item in service.runs.run_items(run_id)
+    } == {"2026R1"}
     assert sum(item["stage"] == "load_session" for item in stage_items) == 1
     assert sum(item["stage"] == "load_reference_data" for item in stage_items) == 1
     assert _row_count(service, "legislators") == 2

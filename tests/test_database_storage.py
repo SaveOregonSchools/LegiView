@@ -4,7 +4,7 @@ import sqlite3
 
 import pytest
 
-from olis_archive.database import Database
+from olis_archive.database import Database, MigrationError
 from olis_archive.services.storage import StorageService
 
 
@@ -42,9 +42,9 @@ def test_migrations_enable_wal_foreign_keys_and_expected_tables(tmp_path):
     path = tmp_path / "state" / "legiview.sqlite3"
     database = Database(path)
 
-    assert database.initialize() == 1
+    assert database.initialize() == 5
     # A second startup is an idempotent migration no-op.
-    assert database.initialize() == 1
+    assert database.initialize() == 5
 
     expected = {
         "schema_migrations",
@@ -62,6 +62,13 @@ def test_migrations_enable_wal_foreign_keys_and_expected_tables(tmp_path):
         "collection_run_items",
         "collection_errors",
         "source_fetches",
+        "source_sync_state",
+        "session_archive_state",
+        "olis_display_reconciliations",
+        "source_anomalies",
+        "document_remote_probes",
+        "source_presence_events",
+        "archive_claim_cursors",
     }
     assert set(database.table_names()) == expected
     assert database.foreign_key_violations() == []
@@ -80,6 +87,41 @@ def test_migrations_enable_wal_foreign_keys_and_expected_tables(tmp_path):
                 """,
                 (T1, T1, T1),
             )
+
+
+@pytest.mark.parametrize(
+    ("history_case", "expected_error"),
+    [
+        ("checksum", "modified after it was applied"),
+        ("gap", "not a contiguous packaged prefix"),
+        ("future", "newer than this LegiView build"),
+    ],
+)
+def test_migration_manifest_rejects_drift_gaps_and_future_schema(
+    tmp_path, history_case, expected_error
+):
+    database = Database(tmp_path / f"{history_case}.sqlite3")
+    assert database.initialize() == 5
+    assert database.migration_manifest_is_current()
+
+    with database.transaction() as connection:
+        if history_case == "checksum":
+            connection.execute(
+                "UPDATE schema_migrations SET checksum=? WHERE version=5", ("0" * 64,)
+            )
+        elif history_case == "gap":
+            connection.execute("DELETE FROM schema_migrations WHERE version=4")
+        else:
+            connection.execute(
+                """
+                INSERT INTO schema_migrations(version,name,checksum,applied_at)
+                VALUES (99,'future','future','2099-01-01T00:00:00Z')
+                """
+            )
+
+    assert not database.migration_manifest_is_current()
+    with pytest.raises(MigrationError, match=expected_error):
+        database.initialize()
 
 
 def test_stable_upserts_preserve_first_seen_and_do_not_duplicate(tmp_path):
@@ -272,6 +314,34 @@ def test_restart_normalization_is_atomic_recoverable_and_idempotent(tmp_path):
     # The interrupted payload attempt remains an audit record.
     assert storage.list_document_versions(document_id)[0]["id"] == version_id
     assert storage.list_document_versions(document_id)[0]["status"] == "interrupted"
+
+
+def test_storage_run_claim_helpers_preserve_single_running_run(tmp_path):
+    storage = make_storage(tmp_path)
+    first = storage.create_run(
+        "collect_session", session_key="2026R1", queued_at=T1
+    )
+    second = storage.create_run(
+        "collect_session", session_key="2026R1", queued_at=T2
+    )
+    third = storage.create_run(
+        "collect_session", session_key="2026R1", queued_at=T3
+    )
+
+    assert storage.claim_collection_run(first, started_at=T1)
+    assert not storage.claim_collection_run(second, started_at=T2)
+    assert storage.claim_next_collection_run(started_at=T2) is None
+    assert storage.get_run(second)["status"] == "queued"
+    assert storage.get_run(third)["status"] == "queued"
+
+    storage.update_collection_run(first, status="completed", changed_at=T2)
+    claimed = storage.claim_next_collection_run(started_at=T3)
+    assert claimed is not None
+    assert claimed["id"] == second
+    assert claimed["status"] == "running"
+    assert storage.get_run(third)["status"] == "queued"
+    with pytest.raises(ValueError, match="claim_collection_run"):
+        storage.update_collection_run(third, status="running", changed_at=T3)
 
 
 def test_reference_watermarks_and_session_scoped_reference_reads(tmp_path):

@@ -12,6 +12,7 @@ from .archive_paths import (
     UnsafeArchivePath,
     ensure_within_archive,
     part_path_for,
+    require_owned_archive_root,
     resolve_stored_path,
     stored_relative_path,
 )
@@ -251,7 +252,10 @@ def cleanup_stale_parts(
     in ``keep_relative_paths``.
     """
 
-    root = _safe_recovery_root(archive_root)
+    # Recursive maintenance is authorized only for an explicitly marked,
+    # dedicated LegiView archive. Targeted recovery above remains constrained
+    # to database-registered relative paths and does not need broad ownership.
+    root = require_owned_archive_root(archive_root)
     keep = {
         stored_relative_path(root, resolve_stored_path(root, relative))
         for relative in keep_relative_paths

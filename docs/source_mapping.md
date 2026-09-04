@@ -22,11 +22,14 @@ known value.
 
 The data page links directly to the service and metadata. During this spike the
 service returned HTTP 200 to ordinary filtered requests with a descriptive User-Agent;
-there was no HTML acceptance form, redirect, acceptance cookie, or other interactive
-gate in the request path, and no gate was bypassed. The linked agreement nevertheless
-says users must electronically accept its terms. LegiView must tell the operator to
-accept/follow those terms through the Legislature's normal process if presented; it
-must never automate acceptance or evade a gate.
+there was no HTML acceptance form, redirect, acceptance cookie, separate submission
+form, or other interactive gate in the request path, and no gate was bypassed. The
+operator explicitly confirmed that they reviewed and agreed to the published terms
+and found no separate form to submit. The linked agreement nevertheless says users
+must electronically accept its terms. LegiView must tell the operator to review and
+agree to those terms before live collection; it must never automate acceptance or
+evade a gate. If an official interactive mechanism is presented, the operator must
+use it.
 
 Relevant current agreement provisions include: prefer OData to regular site
 scraping; on-demand queries are allowed; data is updated approximately every five
@@ -105,7 +108,7 @@ Observed `2026R1`: begin `2026-02-02T00:00:00`, nullable end date, session name
 | Source property | Local field | Observed rule |
 | --- | --- | --- |
 | `SessionKey` | `session_key` | Exact official key. |
-| `MeasurePrefix` | `measure_prefix` | Filter Phase 1 to exact `HB`/`SB`. |
+| `MeasurePrefix` | `measure_prefix` | LegiView scope is exact `HB`/`SB`. |
 | `MeasureNumber` | `measure_number` | `Edm.Int32`; do not store leading-zero display variants as the number. |
 | prefix + number | compact/display IDs | `SB1501` / `SB 1501`; chamber is House for `HB`, Senate for `SB`. |
 | `PrefixMeaning` | raw prefix meaning | Observed `House Bill` and `Senate Bill`; useful audit field. |
@@ -200,7 +203,7 @@ Raw values actually observed:
 | `2015R1/HB2745` | `Presentation` (45), `Meeting Material` (4), `Witness Registration` (1) |
 | `2026R1/SB1501` | `Preliminary SMS`, `Witness Registration`, `Revenue Impact Statement`, `Fiscal Impact Statement`, `Meeting Material`, `Budget Report` |
 
-Safe Phase 1 normalization:
+Safe normalization established in Phase 1 and retained in Phase 2:
 
 - Exact raw `Presentation` -> `committee_presentation`, retaining source section
   `presentations_displayed_in_committee` when confirmed by the OLIS page.
@@ -273,6 +276,12 @@ and a second data request are not needed:
   each document href twice for responsive markup (756 occurrences for 378 IDs).
 - A successful “No items to display” response is a valid zero-result page.
 
+The whole-history Phase 2 run also exposed a legitimate high-volume instance of
+the same modern table shape. `2025R1/SB210` rendered 14,221 displayed testimony
+rows while OData returned 14,222 records (one OData-only row). Its HTML exceeded
+8 MiB, so LegiView's still-bounded OLIS HTML ceiling is 32 MiB. This was a volume
+variant, not a new parser structure or document type.
+
 ### OData/HTML reconciliation quirk
 
 For the same live `2026R1/SB1501` query, OData returned 379 unique
@@ -322,7 +331,7 @@ source created/modified timestamp and no submitter property.
 
 `2026R1/SB1501` had six OData floor letters (IDs 4701, 4703, 4704, 4716, 4717,
 4718), and its OLIS page displayed the same six. OData already contains the required
-Phase 1 floor-letter fields and canonical download URL.
+floor-letter fields and canonical download URL.
 
 ## Confirmed numeric download routes
 
@@ -353,6 +362,65 @@ Never derive the numeric route for one family using an ID from another family.
   do not concatenate it blindly or assume continuation links are absolute.
 - Follow `odata.nextLink` until absent. Treat the token as opaque and retain the same
   User-Agent, timeout, retry, and throttling behavior on each request.
+
+## Phase 2 historical sync contract
+
+The 2026-09-03 metadata inspection supports session-scoped acquisition of the
+following sets. The historical orchestrator uses the official property names shown
+here and checks the live `$metadata` contract before trusting a full backfill.
+
+| Entity set | Stable ordering/key fields used by inventory | Incremental source-date fields | Presence strategy |
+| --- | --- | --- | --- |
+| `Measures` | `MeasurePrefix`, `MeasureNumber` | `CreatedDate`, `ModifiedDate` | HB/SB-only full session comparison; inclusive watermark on later incremental runs. |
+| `Legislators` | `LegislatorCode` | `CreatedDate`, `ModifiedDate` | Session-scoped reference upsert; inclusive watermark supported. |
+| `Committees` | `CommitteeCode` | `CreatedDate`, `ModifiedDate` | Session-scoped reference upsert; inclusive watermark supported. |
+| `MeasureSponsors` | `MeasureSponsorId` | `CreatedDate`, `ModifiedDate` | HB/SB-only upsert; official `LegislatoreCode` spelling retained. |
+| `CommitteeMeetings` | `CommitteeCode`, `MeetingDate` | `CreatedDate`, `ModifiedDate` | Session-scoped upsert. |
+| `CommitteeAgendaItems` | `CommitteeAgendaItemId` | `CreatedDate`, `ModifiedDate` | HB/SB-only upsert; official `CommitteCode` spelling retained. |
+| `CommitteeMeetingDocuments` | `CommitteeMeetingDocumentId` | `CreatedDate`, `ModifiedDate` | HB/SB-only structured document inventory. |
+| `CommitteePublicTestimonies` | `CommTestId` | `CreatedDate`, `ModifiedDate` | HB/SB-only primary modern testimony inventory. |
+| `FloorLetters` | `FloorLetterId` | none in current metadata | Complete session/HB/SB comparison every time; never a fabricated watermark. |
+
+Every request includes an exact `SessionKey` predicate. Measure-scoped sets also use
+`MeasurePrefix eq 'HB' or MeasurePrefix eq 'SB'`. Returned rows are validated against
+that scope; an out-of-scope session or prefix is a source error rather than something
+silently persisted.
+
+The initial/forced-full strategy is authoritative only after every continuation page
+has been fetched, validated, and persisted. A successful full comparison can then
+update presence state. Later date-capable queries use:
+
+```text
+(CreatedDate ge datetime'<watermark>' or ModifiedDate ge datetime'<watermark>')
+```
+
+The boundary is intentionally inclusive. Incremental results never prove source
+disappearance. The next watermark is committed only after complete page consumption;
+a fetch or persistence failure leaves the prior successful cursor in place.
+
+The historical session boundary is also source-derived. LegiView locates official
+session key `2014R1`, compares official `BeginDate` values, and includes every session
+with equal or later chronology. It does not infer scope from key suffixes, calendar
+parity, `DefaultSession`, or a regular-session-only list, so later short and special
+sessions remain eligible. The exact selected keys are frozen into the run scope.
+
+Live/captured metadata validation treats a missing required entity set or mapper
+property as a material diagnostic. It explicitly expects the confirmed official
+typos rather than silently substituting a guessed corrected name. Source timestamps
+remain source strings; current `Edm.DateTime` values do not carry a UTC offset.
+
+## Remote-size probe behavior
+
+An optional inventory probe uses the same official-host and redirect restrictions as
+downloads. It tries HEAD first and, when HEAD is rejected or lacks a usable total,
+uses a bounded one-byte Range GET. The partial response's `Content-Length` is not
+mistaken for the full object size; a total is accepted from a valid
+`Content-Range`. Probe status, time, HTTP status, final URL, type, known length,
+ETag, and Last-Modified are retained when available. No full response body is fetched
+merely to estimate size.
+
+The probe is advisory. Unknown sizes remain eligible, and the sum of known lengths is
+reported as a lower bound rather than as a complete storage forecast.
 
 ## Representative bills and fixture candidates
 
@@ -395,8 +463,10 @@ and already satisfies the pre-2021 requirement.
 ## Unresolved or deliberately unassumed points
 
 - The current agreement PDF retains an electronic-acceptance requirement even
-  though the public endpoint did not present a gate during this spike. Application
-  documentation must keep the user's obligation explicit.
+  though neither the public endpoint nor the operator's site review exposed a
+  separate submission form during this spike. Application documentation must keep
+  the user's obligation explicit and require use of any official mechanism that may
+  later appear.
 - Only observed sponsor and document values above are mapped. The strings are not an
   exhaustive promise for future sessions.
 - The three observed testimony position IDs are confirmed for the tested modern
@@ -408,3 +478,7 @@ and already satisfies the pre-2021 requirement.
 - OData can expose a record whose advertised readiness conflicts with the actual
   downloadable bytes and OLIS display state. File validation and provenance are
   therefore mandatory, and the HTML list remains useful for reconciliation.
+
+See [testimony_discovery.md](testimony_discovery.md) for candidate and tri-state
+display rules, and [completeness.md](completeness.md) for cursor, presence, and
+anomaly effects on session status.

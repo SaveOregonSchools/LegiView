@@ -15,20 +15,41 @@ import math
 import os
 from pathlib import Path, PurePosixPath
 import secrets
+import shutil
 import stat
 from types import SimpleNamespace
 from typing import Any, Mapping
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit
 
-from flask import Flask, abort, flash, redirect, render_template, request, send_file, session, url_for
+from flask import (
+    Flask,
+    Response,
+    abort,
+    flash,
+    redirect,
+    render_template,
+    request,
+    send_file,
+    session,
+    stream_with_context,
+    url_for,
+)
 
-from .config import AppConfig, SETTING_FIELDS
+from .config import (
+    AppConfig,
+    DEFAULT_ALLOWED_DOWNLOAD_HOSTS,
+    ODATA_BASE_URL,
+    SETTING_FIELDS,
+)
 from .runtime import Runtime, build_runtime
 from .services.archive_paths import (
     UnsafeArchivePath,
     resolve_stored_path,
+    validate_archive_root_candidate,
 )
 from .services.collection_workers import CollectionWorkerManager
+from .services.archive_queries import ArchiveQueries
+from .services.csv_exports import stream_query_csv
 from .services.file_types import GENERIC_BINARY_MIME_TYPES, normalize_mime_type, validate_file
 from .services.storage import DOCUMENT_KINDS, DOWNLOAD_STATUSES
 
@@ -44,6 +65,22 @@ DOCUMENT_GROUPS = (
     "committee_document_other",
     "unknown",
 )
+OFFICIAL_SOURCE_HOSTS = frozenset(
+    {
+        *DEFAULT_ALLOWED_DOWNLOAD_HOSTS,
+        str(urlsplit(ODATA_BASE_URL).hostname or "").casefold(),
+    }
+)
+
+
+def _trusted_local_hosts(configured_host: str) -> tuple[str, ...]:
+    trusted = {"localhost", "127.0.0.1", "[::1]"}
+    host = str(configured_host or "").strip().casefold()
+    if host and host not in {"0.0.0.0", "::", "[::]"}:
+        if ":" in host and not host.startswith("["):
+            host = f"[{host}]"
+        trusted.add(host)
+    return tuple(sorted(trusted))
 
 
 def create_app(config_overrides: dict | None = None) -> Flask:
@@ -63,14 +100,18 @@ def create_app(config_overrides: dict | None = None) -> Flask:
         MAX_CONTENT_LENGTH=1024 * 1024,
         SESSION_COOKIE_HTTPONLY=True,
         SESSION_COOKIE_SAMESITE="Lax",
+        # LegiView is a local application.  Reject attacker-controlled Host
+        # headers by default so absolute URLs and host-aware framework behavior
+        # cannot be influenced through DNS rebinding or a forged request.
+        TRUSTED_HOSTS=_trusted_local_hosts(runtime.config.host),
         START_WORKER=True,
     )
     app.config.update(supplied)
 
-    manager = CollectionWorkerManager(
-        runtime.collection,
-        worker_count=runtime.config.odata_worker_count,
-    )
+    # A durable run owns its configured internal concurrency limits.  The outer
+    # dispatcher stays singular so independently queued runs cannot multiply
+    # those limits or race shared document state.
+    manager = CollectionWorkerManager(runtime.collection)
     state: dict[str, Any] = {"runtime": runtime, "workers": manager}
     app.extensions["legiview"] = state
     if app.config["START_WORKER"]:
@@ -91,6 +132,7 @@ def create_app(config_overrides: dict | None = None) -> Flask:
 
     app.jinja_env.filters["human_bytes"] = _human_bytes
     app.jinja_env.filters["human_datetime"] = _human_datetime
+    app.jinja_env.filters["official_source_url"] = _official_source_url
     app.jinja_env.globals["csrf_token"] = _csrf_token
 
     @app.before_request
@@ -117,16 +159,25 @@ def create_app(config_overrides: dict | None = None) -> Flask:
     @app.get("/")
     def home():
         active, _ = current()
-        raw_stats = active.storage.archive_stats()
+        raw_stats = ArchiveQueries(active.database).dashboard_stats()
         stats = {
-            "sessions": raw_stats.get("sessions_stored", 0),
-            "bills": raw_stats.get("bills_stored", 0),
-            "sponsors": raw_stats.get("sponsors_stored", 0),
+            "sessions": raw_stats.get("sessions_in_scope", 0),
+            "sessions_complete": raw_stats.get("sessions_inventory_complete", 0),
+            "bills": raw_stats.get("bills", 0),
             "documents_discovered": raw_stats.get("documents_discovered", 0),
+            "public_testimony": raw_stats.get("public_testimony", 0),
+            "presentation_legacy": raw_stats.get("presentation_legacy", 0),
+            "floor_letters": raw_stats.get("floor_letters", 0),
             "documents_downloaded": raw_stats.get("documents_downloaded", 0),
             "download_failures": raw_stats.get("download_failures", 0),
             "archive_bytes": _human_bytes(raw_stats.get("archive_bytes", 0)),
-            "last_completed_collection": _human_datetime(raw_stats.get("last_completed_collection")),
+            "known_remote_bytes": _human_bytes(raw_stats.get("known_remote_bytes", 0)),
+            "known_size_documents": raw_stats.get("known_size_documents", 0),
+            "unknown_size_documents": raw_stats.get("unknown_size_documents", 0),
+            "disk_free": _human_bytes(_disk_free(active.config.archive_root)),
+            "last_historical_inventory": _human_datetime(
+                raw_stats.get("last_historical_inventory")
+            ),
         }
         recent = [_present_run(row) for row in active.collection.runs.list_runs(8)]
         return render_template("home.html", stats=stats, recent_runs=recent)
@@ -186,6 +237,253 @@ def create_app(config_overrides: dict | None = None) -> Flask:
             recent_runs=recent,
         )
 
+    @app.route("/inventory-backfill", methods=["GET", "POST"])
+    def inventory_backfill():
+        """Resolve and snapshot an explicit historical inventory scope."""
+
+        active, workers = current()
+        queries = ArchiveQueries(active.database)
+        source_error: str | None = None
+        sessions = queries.session_choices()
+
+        action = request.form.get("action", "start") if request.method == "POST" else None
+
+        # Ordinary GET requests remain offline.  Source discovery is an
+        # intentional, CSRF-protected POST action; run creation independently
+        # resolves and freezes the authoritative scope.
+        if request.method == "POST" and action == "resolve":
+            try:
+                resolved = active.collection.historical_session_scope()
+                sessions = _official_session_rows(
+                    resolved,
+                    queries.session_state_map(resolved.session_keys),
+                )
+            except Exception as exc:  # Source failures must be visible, not fatal to Flask.
+                LOGGER.warning("Unable to resolve official historical session scope", exc_info=True)
+                source_error = str(exc)
+
+        selected_values = [
+            value.strip().upper()
+            for value in request.values.getlist("session_keys")
+            if value.strip()
+        ]
+        if (request.method == "GET" or action == "resolve") and not selected_values:
+            selected_values = [str(row["session_key"]) for row in sessions]
+
+        if request.method == "POST" and action != "resolve":
+            probe_remote_sizes = request.form.get("probe_remote_sizes") == "1"
+            force_full = request.form.get("force_full") == "1"
+            # An empty database is a supported first-run state: None tells the
+            # service to resolve every official session at/after 2014R1.
+            selected_scope = selected_values or None
+            if sessions and selected_scope is None:
+                flash("Select at least one historical session.", "error")
+            else:
+                try:
+                    run_id = active.collection.create_inventory_backfill_run(
+                        selected_scope,
+                        probe_remote_sizes=probe_remote_sizes,
+                        force_full=force_full,
+                    )
+                except (OSError, RuntimeError, TypeError, ValueError) as exc:
+                    flash(f"Inventory Backfill was not started: {exc}", "error")
+                else:
+                    workers.enqueue(run_id)
+                    flash(
+                        f"Inventory Backfill run #{run_id} was queued. Payload download was not started.",
+                        "success",
+                    )
+                    return redirect(url_for("run_detail", run_id=run_id), code=303)
+
+        return render_template(
+            "inventory_backfill.html",
+            sessions=sessions,
+            selected_sessions=set(selected_values),
+            source_error=source_error,
+            paths={
+                "project_root": active.config.project_root,
+                "archive_root": active.config.archive_root,
+                "disk_free": _human_bytes(_disk_free(active.config.archive_root)),
+            },
+            pacing={
+                "odata_workers": active.config.odata_worker_count,
+                "html_concurrency": active.config.html_request_concurrency,
+                "delay": active.config.inter_request_delay,
+            },
+        )
+
+    @app.route("/download-archive", methods=["GET", "POST"])
+    def download_archive():
+        """Preview and explicitly start bounded archive download work."""
+
+        active, workers = current()
+        queries = ArchiveQueries(active.database)
+        sessions = queries.session_choices(inventoried_only=True)
+        all_session_keys = [str(row["session_key"]) for row in sessions]
+        selected_values = [
+            value.strip().upper()
+            for value in request.values.getlist("session_keys")
+            if value.strip().upper() in set(all_session_keys)
+        ]
+        if request.method == "GET" and "preview" not in request.args:
+            selected_values = all_session_keys
+        selected_kinds = [
+            value.strip()
+            for value in request.values.getlist("document_kinds")
+            if value.strip() in DOCUMENT_KINDS
+        ]
+        mode = request.values.get("eligibility", "missing_pending").strip()
+        retryable_only = mode == "retryable"
+        preview_error: str | None = None
+        if selected_values:
+            try:
+                source_preflight = active.collection.download_archive_preflight(
+                    selected_values,
+                    document_kinds=selected_kinds or None,
+                    retryable_failures_only=retryable_only,
+                    missing_pending_only=not retryable_only,
+                )
+            except (OSError, RuntimeError, TypeError, ValueError) as exc:
+                preview_error = str(exc)
+                source_preflight = None
+        else:
+            source_preflight = None
+        if source_preflight is None:
+            disk_free = _disk_free(active.config.archive_root)
+            floor_bytes = int(active.config.minimum_free_space_bytes or 0)
+            preflight = SimpleNamespace(
+                documents_in_scope=0,
+                recorded_downloaded=0,
+                pending_missing=0,
+                retryable_failures=0,
+                terminal_or_non_downloadable=0,
+                eligible_documents=0,
+                known_pending_bytes=0,
+                unknown_size_pending=0,
+            )
+            blocked = bool(preview_error)
+        else:
+            disk_free = int(source_preflight.free_bytes)
+            floor_bytes = int(source_preflight.minimum_free_space_bytes)
+            preflight = SimpleNamespace(
+                documents_in_scope=source_preflight.documents_in_scope,
+                recorded_downloaded=source_preflight.already_downloaded,
+                pending_missing=source_preflight.pending_or_missing,
+                retryable_failures=source_preflight.retryable_failures,
+                terminal_or_non_downloadable=source_preflight.terminal_or_non_downloadable,
+                eligible_documents=source_preflight.pending_or_missing,
+                known_pending_bytes=source_preflight.known_pending_bytes,
+                unknown_size_pending=source_preflight.unknown_size_pending,
+            )
+            blocked = not source_preflight.known_bytes_fit
+        usable_bytes = max(0, disk_free - floor_bytes)
+        block_reason = preview_error
+        if blocked and block_reason is None:
+            block_reason = (
+                f"Known pending payloads require {_human_bytes(preflight.known_pending_bytes)}, "
+                f"but only {_human_bytes(usable_bytes)} is available above the configured floor."
+            )
+
+        if request.method == "POST" and request.form.get("action") != "preview":
+            if not selected_values:
+                flash("Select at least one inventoried session.", "error")
+            elif blocked:
+                flash(f"Download Archive was not started: {block_reason}", "error")
+            elif preflight.documents_in_scope < 1 or (
+                retryable_only and preflight.eligible_documents < 1
+            ):
+                flash("No documents match the selected archive scope.", "error")
+            else:
+                try:
+                    run_id = active.collection.create_download_archive_run(
+                        selected_values,
+                        document_kinds=selected_kinds or None,
+                        retryable_failures_only=retryable_only,
+                        missing_pending_only=not retryable_only,
+                    )
+                except (OSError, RuntimeError, TypeError, ValueError) as exc:
+                    flash(f"Download Archive was not started: {exc}", "error")
+                else:
+                    workers.enqueue(run_id)
+                    flash(f"Download Archive run #{run_id} was queued.", "success")
+                    return redirect(url_for("run_detail", run_id=run_id), code=303)
+
+        return render_template(
+            "download_archive.html",
+            sessions=sessions,
+            selected_sessions=set(selected_values),
+            document_kinds=sorted(DOCUMENT_KINDS),
+            selected_kinds=set(selected_kinds),
+            eligibility=mode,
+            preflight=preflight,
+            disk={
+                "free_bytes": disk_free,
+                "free": _human_bytes(disk_free),
+                "floor_bytes": floor_bytes,
+                "floor": _human_bytes(floor_bytes),
+                "floor_gb": active.config.minimum_free_space_gb,
+                "usable": _human_bytes(usable_bytes),
+            },
+            archive_root=active.config.archive_root,
+            worker_count=active.config.download_worker_count,
+            blocked=blocked,
+            block_reason=block_reason,
+            preview_error=preview_error,
+        )
+
+    @app.get("/session-status")
+    def session_status():
+        active, _ = current()
+        filters = SimpleNamespace(
+            session=request.args.get("session", "").strip().upper(),
+            inventory_status=request.args.get("inventory_status", "").strip(),
+        )
+        page = _page_number(request.args.get("page"))
+        result = ArchiveQueries(active.database).session_status(
+            session_key=filters.session or None,
+            inventory_status=filters.inventory_status or None,
+            limit=PAGE_SIZE,
+            offset=(page - 1) * PAGE_SIZE,
+        )
+        return render_template(
+            "session_status.html",
+            filters=filters,
+            rows=result.rows,
+            pagination=_pagination(
+                page,
+                page * PAGE_SIZE < result.total,
+                request.args,
+                total=result.total,
+            ),
+        )
+
+    @app.get("/operations")
+    def operations():
+        active, _ = current()
+        view = request.args.get("view", "errors").strip()
+        if view not in {"errors", "anomalies"}:
+            view = "errors"
+        filters = _operation_request_filters(request.args, view=view)
+        page = _page_number(request.args.get("page"))
+        result = ArchiveQueries(active.database).operations(
+            view=view,
+            **_operation_query_filters(filters),
+            limit=PAGE_SIZE,
+            offset=(page - 1) * PAGE_SIZE,
+        )
+        return render_template(
+            "operations.html",
+            filters=filters,
+            rows=result.rows,
+            document_kinds=sorted(DOCUMENT_KINDS),
+            pagination=_pagination(
+                page,
+                page * PAGE_SIZE < result.total,
+                request.args,
+                total=result.total,
+            ),
+        )
+
     @app.get("/bills")
     def bills():
         active, _ = current()
@@ -193,12 +491,13 @@ def create_app(config_overrides: dict | None = None) -> Flask:
             session=request.args.get("session", "").strip().upper(),
             chamber=request.args.get("chamber", "").strip(),
             q=request.args.get("q", "").strip(),
+            sponsor=request.args.get("sponsor", "").strip(),
             enacted=request.args.get("enacted", "").strip(),
             sort=request.args.get("sort", "bill").strip(),
         )
         page = _page_number(request.args.get("page"))
         sort = "last_synced" if filters.sort == "last_sync" else filters.sort
-        if sort not in {"bill", "title", "chapter"}:
+        if sort not in {"bill", "title", "chapter", "last_synced", "documents"}:
             sort = "bill"
             filters.sort = "bill"
         enacted = True if filters.enacted == "enacted" else False if filters.enacted == "not_enacted" else None
@@ -206,17 +505,17 @@ def create_app(config_overrides: dict | None = None) -> Flask:
             session_key=filters.session or None,
             chamber=filters.chamber or None,
             query=filters.q or None,
+            sponsor=filters.sponsor or None,
             enacted=enacted,
             sort=sort,
             descending=sort == "last_synced",
         )
-        rows = active.storage.list_bills(
+        result = ArchiveQueries(active.database).bills(
             **query_args,
-            limit=PAGE_SIZE + 1,
+            limit=PAGE_SIZE,
             offset=(page - 1) * PAGE_SIZE,
         )
-        has_next = len(rows) > PAGE_SIZE
-        rows = rows[:PAGE_SIZE]
+        rows = list(result.rows)
         for row in rows:
             if row.get("sponsor_summary"):
                 row["sponsor_summary"] = ", ".join(
@@ -229,7 +528,12 @@ def create_app(config_overrides: dict | None = None) -> Flask:
             filters=filters,
             session_options=_session_options(active),
             rows=rows,
-            pagination=_pagination(page, has_next, request.args),
+            pagination=_pagination(
+                page,
+                page * PAGE_SIZE < result.total,
+                request.args,
+                total=result.total,
+            ),
         )
 
     @app.get("/bills/<int:bill_id>")
@@ -239,7 +543,14 @@ def create_app(config_overrides: dict | None = None) -> Flask:
         if bill is None:
             abort(404)
         sponsors = [_present_sponsor(row) for row in active.storage.list_bill_sponsors(bill_id)]
-        documents = [_present_document(row) for row in active.storage.list_bill_documents(bill_id)]
+        document_page_number = _page_number(request.args.get("document_page"))
+        document_page = ArchiveQueries(active.database).documents(
+            session_key=str(bill["session_key"]),
+            bill_id_compact=str(bill["bill_id_compact"]),
+            limit=PAGE_SIZE,
+            offset=(document_page_number - 1) * PAGE_SIZE,
+        )
+        documents = [_present_document(row) for row in document_page.rows]
         for document in documents:
             if _registered_local_file(active, document) is not None:
                 document["local_action_url"] = url_for("document_file", document_id=document["id"])
@@ -300,6 +611,13 @@ def create_app(config_overrides: dict | None = None) -> Flask:
             ],
             agenda_items=agenda_items,
             document_groups=groups,
+            document_pagination=_pagination(
+                document_page_number,
+                document_page_number * PAGE_SIZE < document_page.total,
+                request.args,
+                total=document_page.total,
+                page_key="document_page",
+            ),
         )
 
     @app.get("/documents")
@@ -311,25 +629,30 @@ def create_app(config_overrides: dict | None = None) -> Flask:
             kind=request.args.get("kind", "").strip(),
             committee=request.args.get("committee", "").strip(),
             submitter=request.args.get("submitter", "").strip(),
+            organization=request.args.get("organization", "").strip(),
             position=request.args.get("position", "").strip(),
             download_status=request.args.get("download_status", "").strip(),
+            source_presence=request.args.get("source_presence", "").strip(),
+            displayed_in_olis=request.args.get("displayed_in_olis", "").strip(),
             failed_only=request.args.get("failed_only") == "1",
         )
         page = _page_number(request.args.get("page"))
-        rows = active.storage.list_documents(
+        result = ArchiveQueries(active.database).documents(
             session_key=filters.session or None,
             bill_id_compact=filters.bill or None,
             document_kind=filters.kind or None,
             committee=filters.committee or None,
             submitter=filters.submitter or None,
+            organization=filters.organization or None,
             testimony_position=filters.position or None,
             download_status=filters.download_status or None,
+            source_presence=filters.source_presence or None,
+            displayed_in_olis=filters.displayed_in_olis or "any",
             failed_only=filters.failed_only,
-            limit=PAGE_SIZE + 1,
+            limit=PAGE_SIZE,
             offset=(page - 1) * PAGE_SIZE,
         )
-        has_next = len(rows) > PAGE_SIZE
-        presented = [_present_document(row) for row in rows[:PAGE_SIZE]]
+        presented = [_present_document(row) for row in result.rows]
         return render_template(
             "documents.html",
             filters=filters,
@@ -337,7 +660,12 @@ def create_app(config_overrides: dict | None = None) -> Flask:
             document_kinds=sorted(DOCUMENT_KINDS),
             download_statuses=sorted(DOWNLOAD_STATUSES),
             rows=presented,
-            pagination=_pagination(page, has_next, request.args),
+            pagination=_pagination(
+                page,
+                page * PAGE_SIZE < result.total,
+                request.args,
+                total=result.total,
+            ),
         )
 
     @app.get("/documents/<int:document_id>")
@@ -355,6 +683,7 @@ def create_app(config_overrides: dict | None = None) -> Flask:
             document=presented,
             bill=bill,
             versions=active.storage.list_document_versions(document_id),
+            probe=active.storage.get_document_probe(document_id),
         )
 
     @app.get("/documents/<int:document_id>/file")
@@ -379,25 +708,25 @@ def create_app(config_overrides: dict | None = None) -> Flask:
             status=request.args.get("status", "").strip(),
             scope=request.args.get("scope", "").strip().casefold(),
         )
-        all_rows = active.collection.runs.list_runs(1000)
-        selected = []
-        for row in all_rows:
-            presented = _present_run(row)
-            if filters.run_type and row.get("run_type") != filters.run_type:
-                continue
-            if filters.status and row.get("status") != filters.status:
-                continue
-            if filters.scope and filters.scope not in presented["scope_display"].casefold():
-                continue
-            selected.append(presented)
         page = _page_number(request.args.get("page"))
-        start = (page - 1) * PAGE_SIZE
-        rows = selected[start : start + PAGE_SIZE]
+        result = ArchiveQueries(active.database).runs(
+            run_type=filters.run_type or None,
+            status=filters.status or None,
+            scope=filters.scope or None,
+            limit=PAGE_SIZE,
+            offset=(page - 1) * PAGE_SIZE,
+        )
+        rows = [_present_run(row) for row in result.rows]
         return render_template(
             "runs.html",
             filters=filters,
             rows=rows,
-            pagination=_pagination(page, start + PAGE_SIZE < len(selected), request.args, total=len(selected)),
+            pagination=_pagination(
+                page,
+                page * PAGE_SIZE < result.total,
+                request.args,
+                total=result.total,
+            ),
         )
 
     @app.get("/runs/<int:run_id>")
@@ -406,19 +735,72 @@ def create_app(config_overrides: dict | None = None) -> Flask:
         run = active.collection.runs.get_run(run_id)
         if run is None:
             abort(404)
-        items = active.collection.runs.run_items(run_id)
-        stages = [_present_stage(item) for item in items if item.get("item_type") == "stage"]
-        work_items = [_present_run_item(active, item) for item in items if item.get("item_type") != "stage"]
+        queries = ArchiveQueries(active.database)
+        item_page_number = _page_number(request.args.get("item_page"))
+        error_page_number = _page_number(request.args.get("error_page"))
+        item_page = queries.run_items(
+            run_id,
+            limit=PAGE_SIZE,
+            offset=(item_page_number - 1) * PAGE_SIZE,
+        )
+        error_page = queries.run_errors(
+            run_id,
+            limit=PAGE_SIZE,
+            offset=(error_page_number - 1) * PAGE_SIZE,
+        )
+        stages = [_present_stage(item) for item in queries.run_stages(run_id)]
+        work_items = [_present_run_item(active, item) for item in item_page.rows]
         presented = _present_run(run)
+        # Keep the summary count identical to the Operations view linked from
+        # this page: anomalies qualify when this run first or most recently
+        # observed them.
+        presented["anomaly_count"] = queries.operations(
+            view="anomalies",
+            run_id=run_id,
+            limit=1,
+            offset=0,
+        ).total
+        disk_free = _disk_free(active.config.archive_root)
         return render_template(
             "run_detail.html",
             run=presented,
             stages=stages,
             items=work_items,
-            errors=active.collection.runs.errors(run_id),
+            errors=error_page.rows,
+            item_pagination=_pagination(
+                item_page_number,
+                item_page_number * PAGE_SIZE < item_page.total,
+                request.args,
+                total=item_page.total,
+                page_key="item_page",
+            ),
+            error_pagination=_pagination(
+                error_page_number,
+                error_page_number * PAGE_SIZE < error_page.total,
+                request.args,
+                total=error_page.total,
+                page_key="error_page",
+            ),
+            disk={
+                "free": _human_bytes(disk_free),
+                "floor": _human_bytes(active.config.minimum_free_space_bytes),
+                "floor_gb": active.config.minimum_free_space_gb,
+            },
             config_snapshot=_json_dict(run.get("config_snapshot_json")),
             elapsed=_elapsed(run),
         )
+
+    @app.post("/runs/<int:run_id>/pause")
+    def pause_run(run_id: int):
+        active, _ = current()
+        if active.collection.runs.pause(run_id, "Paused by operator"):
+            flash(
+                f"Run #{run_id} is pausing. Active transfers will wind down safely.",
+                "success",
+            )
+        else:
+            flash(f"Run #{run_id} is not currently running.", "warning")
+        return redirect(url_for("run_detail", run_id=run_id), code=303)
 
     @app.post("/runs/<int:run_id>/cancel")
     def cancel_run(run_id: int):
@@ -443,55 +825,133 @@ def create_app(config_overrides: dict | None = None) -> Flask:
     def retry_failures():
         active, workers = current()
         run_id_text = request.values.get("run_id", "").strip()
-        source_run_id = int(run_id_text) if run_id_text.isdigit() else None
+        source_run_id = (
+            int(run_id_text)
+            if run_id_text.isdigit()
+            else -1
+            if run_id_text
+            else None
+        )
         filters = SimpleNamespace(
-            run_id=source_run_id,
+            run_id=run_id_text,
             session=request.values.get("session", "").strip().upper(),
             bill=request.values.get("bill", "").replace(" ", "").strip().upper(),
         )
-        candidates = active.storage.list_documents_for_retry(
+        page = _page_number(request.values.get("page"))
+        result = ArchiveQueries(active.database).retry_documents(
             run_id=source_run_id,
+            session_key=filters.session or None,
+            bill_id_compact=filters.bill or None,
             include_terminal=True,
-            limit=100_000,
+            limit=PAGE_SIZE,
+            offset=(page - 1) * PAGE_SIZE,
         )
-        candidates = [
-            row
-            for row in candidates
-            if (not filters.session or row.get("session_key") == filters.session)
-            and (not filters.bill or row.get("bill_id_compact") == filters.bill)
-        ]
+        candidates = list(result.rows)
         if request.method == "POST":
-            selected_ids = [int(value) for value in request.form.getlist("document_ids") if value.isdigit()]
             if request.form.get("action") == "all":
-                selected_ids = [int(row["id"]) for row in candidates]
-            allowed = {int(row["id"]) for row in candidates}
-            selected_ids = list(dict.fromkeys(value for value in selected_ids if value in allowed))
-            if not selected_ids:
-                flash("Select at least one retryable document.", "error")
+                try:
+                    run_id, matching_count = active.collection.create_retry_matching_run(
+                        source_run_id=source_run_id,
+                        session_key=filters.session or None,
+                        bill_id_compact=filters.bill or None,
+                    )
+                except (TypeError, ValueError) as exc:
+                    flash(f"Matching retries were not queued: {exc}", "error")
+                else:
+                    workers.enqueue(run_id)
+                    flash(
+                        f"Retry run #{run_id} was queued for all "
+                        f"{matching_count} matching document(s).",
+                        "success",
+                    )
+                    return redirect(url_for("run_detail", run_id=run_id), code=303)
             else:
-                run_id = active.collection.runs.create_run(
-                    "retry_failures",
-                    session_key=filters.session or None,
-                    bill_id_compact=filters.bill or None,
-                    scope={"source_run_id": source_run_id, "document_ids": selected_ids},
-                    config_snapshot=active.config.snapshot(),
+                selected_ids = [
+                    int(value)
+                    for value in request.form.getlist("document_ids")
+                    if value.isdigit()
+                ]
+                allowed = {int(row["id"]) for row in candidates}
+                selected_ids = list(
+                    dict.fromkeys(value for value in selected_ids if value in allowed)
                 )
-                workers.enqueue(run_id)
-                flash(f"Retry run #{run_id} was queued for {len(selected_ids)} document(s).", "success")
-                return redirect(url_for("run_detail", run_id=run_id), code=303)
+                if not selected_ids:
+                    flash("Select at least one document to retry.", "error")
+                else:
+                    run_id = active.collection.runs.create_run(
+                        "retry_failures",
+                        session_key=filters.session or None,
+                        bill_id_compact=filters.bill or None,
+                        scope={
+                            "source_run_id": source_run_id,
+                            "document_ids": selected_ids,
+                        },
+                        config_snapshot=active.config.snapshot(),
+                    )
+                    workers.enqueue(run_id)
+                    flash(
+                        f"Retry run #{run_id} was queued for "
+                        f"{len(selected_ids)} document(s).",
+                        "success",
+                    )
+                    return redirect(url_for("run_detail", run_id=run_id), code=303)
         presented = [_present_document(row) for row in candidates]
         stats = {
-            "retryable_failures": sum(row.get("download_status") == "failed_retryable" for row in candidates),
+            "retryable_failures": _document_status_count(active, "failed_retryable"),
             "terminal_failures": _document_status_count(active, "failed_terminal"),
-            "interrupted": sum(row.get("download_status") == "interrupted" for row in candidates),
-            "paused_low_space": sum(row.get("download_status") == "paused_low_space" for row in candidates),
+            "interrupted": _document_status_count(active, "interrupted"),
+            "paused_low_space": _document_status_count(active, "paused_low_space"),
         }
         return render_template(
             "retry_failures.html",
             stats=stats,
             filters=filters,
             rows=presented,
+            pagination=_pagination(
+                page,
+                page * PAGE_SIZE < result.total,
+                request.args,
+                total=result.total,
+            ),
         )
+
+    @app.get("/exports/sessions.csv")
+    def export_sessions():
+        active, _ = current()
+        sql, params = ArchiveQueries(active.database).session_export_query()
+        return _csv_response(active, sql, params, "legiview-session-inventory.csv")
+
+    @app.get("/exports/documents.csv")
+    def export_documents():
+        active, _ = current()
+        filters = {
+            "session": request.args.get("session", "").strip().upper(),
+            "bill": request.args.get("bill", "").replace(" ", "").strip().upper(),
+            "kind": request.args.get("kind", "").strip(),
+            "committee": request.args.get("committee", "").strip(),
+            "submitter": request.args.get("submitter", "").strip(),
+            "organization": request.args.get("organization", "").strip(),
+            "position": request.args.get("position", "").strip(),
+            "download_status": request.args.get("download_status", "").strip(),
+            "source_presence": request.args.get("source_presence", "").strip(),
+            "displayed_in_olis": request.args.get("displayed_in_olis", "").strip() or "any",
+            "failed_only": request.args.get("failed_only") == "1",
+        }
+        sql, params = ArchiveQueries(active.database).document_export_query(filters)
+        return _csv_response(active, sql, params, "legiview-document-inventory.csv")
+
+    @app.get("/exports/operations.csv")
+    def export_operations():
+        active, _ = current()
+        view = request.args.get("view", "errors").strip()
+        if view not in {"all", "errors", "anomalies"}:
+            abort(400, description="Unknown operations export view.")
+        filters = _operation_request_filters(request.args, view=view)
+        sql, params = ArchiveQueries(active.database).operations_export_query(
+            view=view,
+            **_operation_query_filters(filters),
+        )
+        return _csv_response(active, sql, params, "legiview-failures-anomalies.csv")
 
     @app.route("/settings", methods=["GET", "POST"])
     def settings():
@@ -500,17 +960,23 @@ def create_app(config_overrides: dict | None = None) -> Flask:
             submitted = {key: request.form.get(key, "").strip() for key in SETTING_FIELDS}
             try:
                 validated = active.config.with_settings(submitted)
-                archive_root = validated.archive_root.expanduser().resolve(strict=False)
-                if archive_root == Path(archive_root.anchor):
-                    raise ValueError("Archive root cannot be a filesystem root.")
-                if archive_root.exists() and not archive_root.is_dir():
-                    raise ValueError("Archive root points to an existing non-directory path.")
-                archive_root.mkdir(parents=True, exist_ok=True)
+                # Settings validation is deliberately read-only. The next
+                # locked startup creates the ownership marker only after the
+                # configured path has been accepted as a dedicated archive.
+                validate_archive_root_candidate(validated.archive_root)
             except (OSError, TypeError, ValueError) as exc:
                 flash(f"Settings were not saved: {exc}", "error")
             else:
+                snapshot = validated.snapshot()
                 for key in SETTING_FIELDS:
-                    value = validated.snapshot()[key]
+                    # Archive paths saved by the UI remain relative and
+                    # portable when that is what the operator entered. The
+                    # runtime resolves them against the bootstrap project root.
+                    value = (
+                        validated.archive_root_configured
+                        if key == "archive_root"
+                        else snapshot[key]
+                    )
                     active.storage.set_setting(key, value, updated_by="web")
                 # Never swap archive roots or worker graphs while this process
                 # is alive. A paused/canceled run can still have an HTTP read
@@ -553,6 +1019,24 @@ def _session_options(runtime: Runtime) -> list[dict[str, Any]]:
     return rows
 
 
+def _official_session_rows(
+    scope: Any,
+    stored: Mapping[str, Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for session_record in scope.sessions:
+        row = {
+            "session_key": session_record.session_key,
+            "session_name": session_record.session_name,
+            "begin_date": session_record.begin_date,
+            "end_date": session_record.end_date,
+            "inventory_status": "not_started",
+        }
+        row.update(stored.get(session_record.session_key, {}))
+        rows.append(row)
+    return rows
+
+
 def _present_document(row: Mapping[str, Any]) -> dict[str, Any]:
     result = dict(row)
     result["position"] = row.get("testimony_position")
@@ -573,7 +1057,26 @@ def _present_run(row: Mapping[str, Any]) -> dict[str, Any]:
     session = row.get("requested_session_key") or scope.get("session_key")
     bill = row.get("requested_bill_id_compact") or scope.get("bill_id_compact")
     source_run = scope.get("source_run_id")
-    if session and bill:
+    retry_match = scope.get("retry_match")
+    session_keys = scope.get("session_keys")
+    if isinstance(retry_match, dict):
+        count = retry_match.get("matching_count")
+        display = (
+            f"All {count} matching failed documents"
+            if count
+            else "All matching failed documents"
+        )
+    elif isinstance(session_keys, list) and session_keys:
+        if len(session_keys) == 1:
+            display = str(session_keys[0])
+        else:
+            display = f"{len(session_keys)} sessions ({session_keys[0]} through {session_keys[-1]})"
+        kinds = scope.get("document_kinds")
+        if row.get("run_type") == "download_archive" and kinds:
+            display += " / " + ", ".join(
+                str(kind).replace("_", " ") for kind in kinds
+            )
+    elif session and bill:
         display = f"{session} / {_display_bill(bill)}"
     elif session:
         display = str(session)
@@ -589,11 +1092,19 @@ def _present_run(row: Mapping[str, Any]) -> dict[str, Any]:
         bill_id_display=_display_bill(bill),
         max_bills=scope.get("max_bills"),
         bills_planned=row.get("bills_total"),
-        items_total=row.get("bills_total"),
-        items_completed=row.get("bills_completed"),
+        items_total=row.get("sessions_total") or row.get("bills_total"),
+        items_completed=(
+            row.get("sessions_completed")
+            if row.get("run_type") in {"inventory_backfill", "download_archive"}
+            else row.get("bills_completed")
+        ),
         errors=row.get("error_count"),
         skipped_count=row.get("documents_skipped"),
         cancel_requested=row.get("status") == "canceled",
+        scope_cutoff_at=row.get("scope_cutoff_at") or scope.get("scope_cutoff_at"),
+        probe_remote_sizes=scope.get("probe_remote_sizes", False),
+        force_full=scope.get("force_full", False),
+        session_keys=session_keys if isinstance(session_keys, list) else [],
     )
     return result
 
@@ -610,17 +1121,53 @@ def _present_stage(item: Mapping[str, Any]) -> dict[str, Any]:
 def _present_run_item(runtime: Runtime, item: Mapping[str, Any]) -> dict[str, Any]:
     result = dict(item)
     result["message"] = item.get("current_activity")
+    details = _json_dict(item.get("details_json"))
+    counts = details.get("counts")
+    if not isinstance(counts, dict):
+        download_counts = details.get("download_counts")
+        counts = download_counts if isinstance(download_counts, dict) else {}
+    preferred_counts = (
+        ("bills", "bills"),
+        ("documents", "documents"),
+        ("sponsors", "sponsors"),
+        ("committees", "committees"),
+        ("committee_documents", "committee documents"),
+        ("public_testimony", "public testimony"),
+        ("floor_letters", "floor letters"),
+        ("olis_pages_checked", "OLIS pages checked"),
+        ("olis_pages_failed", "OLIS pages failed"),
+        ("olis_pages_anomalous", "OLIS anomalies"),
+        ("probes_known", "known-size probes"),
+        ("probes_unknown", "unknown-size probes"),
+        ("probes_failed", "probe failures"),
+        ("completed", "downloaded"),
+        ("skipped", "skipped"),
+        ("failed_retryable", "retryable failures"),
+        ("failed_terminal", "terminal failures"),
+    )
+    result["detail_summary"] = ", ".join(
+        f"{counts[key]} {label}" for key, label in preferred_counts if key in counts
+    )
+    result["inventory_status"] = details.get("inventory_status")
     if item.get("document_id"):
-        document = runtime.storage.get_document(int(item["document_id"]))
-        if document:
-            result["document_title"] = document.get("title")
-            result["source_document_id"] = document.get("source_id")
-            result["label"] = document.get("title") or f"Document {document.get('source_id')}"
+        if item.get("document_title") or item.get("source_document_id"):
+            result["label"] = item.get("document_title") or f"Document {item.get('source_document_id')}"
+        else:
+            document = runtime.storage.get_document(int(item["document_id"]))
+            if document:
+                result["document_title"] = document.get("title")
+                result["source_document_id"] = document.get("source_id")
+                result["label"] = document.get("title") or f"Document {document.get('source_id')}"
     elif item.get("bill_id"):
-        bill = runtime.storage.get_bill_by_id(int(item["bill_id"]))
-        if bill:
-            result["bill_id_display"] = bill.get("bill_id_display")
-            result["label"] = bill.get("bill_id_display")
+        if item.get("bill_id_display"):
+            result["label"] = item.get("bill_id_display")
+        else:
+            bill = runtime.storage.get_bill_by_id(int(item["bill_id"]))
+            if bill:
+                result["bill_id_display"] = bill.get("bill_id_display")
+                result["label"] = bill.get("bill_id_display")
+    elif item.get("session_key"):
+        result["label"] = item.get("session_key")
     else:
         result["label"] = item.get("item_key")
     return result
@@ -693,6 +1240,31 @@ def _path_contains_link_or_reparse_point(root: Path, parts: tuple[str, ...]) -> 
     return False
 
 
+def _official_source_url(value: Any) -> str | None:
+    """Return a clickable official URL only after strict origin validation."""
+
+    if not isinstance(value, str):
+        return None
+    candidate = value.strip()
+    if not candidate or any(ord(character) < 32 for character in candidate):
+        return None
+    try:
+        parsed = urlsplit(candidate)
+        port = parsed.port
+    except ValueError:
+        return None
+    host = (parsed.hostname or "").casefold().rstrip(".")
+    if (
+        parsed.scheme.casefold() != "https"
+        or host not in OFFICIAL_SOURCE_HOSTS
+        or parsed.username is not None
+        or parsed.password is not None
+        or port not in {None, 443}
+    ):
+        return None
+    return candidate
+
+
 def _csrf_token() -> str:
     token = session.get(CSRF_SESSION_KEY)
     if not isinstance(token, str) or len(token) < 32:
@@ -706,16 +1278,78 @@ def _document_status_count(runtime: Runtime, status: str) -> int:
         return int(connection.execute("SELECT COUNT(*) FROM documents WHERE download_status=?", (status,)).fetchone()[0])
 
 
+def _operation_request_filters(
+    args: Mapping[str, Any], *, view: str
+) -> SimpleNamespace:
+    run_text = str(args.get("run", "")).strip()
+    return SimpleNamespace(
+        view=view,
+        run_id=int(run_text) if run_text.isdigit() else None,
+        session=str(args.get("session", "")).strip().upper(),
+        bill=str(args.get("bill", "")).replace(" ", "").strip().upper(),
+        stage=str(args.get("stage", "")).strip(),
+        kind=str(args.get("kind", "")).strip(),
+        retryable=str(args.get("retryable", "")).strip(),
+        error_class=str(args.get("error_class", "")).strip(),
+        anomaly_type=str(args.get("anomaly_type", "")).strip(),
+        severity=str(args.get("severity", "")).strip(),
+        include_resolved=str(args.get("include_resolved", "")) == "1",
+    )
+
+
+def _operation_query_filters(filters: SimpleNamespace) -> dict[str, Any]:
+    return {
+        "run_id": filters.run_id,
+        "session_key": filters.session or None,
+        "bill_id_compact": filters.bill or None,
+        "stage_or_entity": filters.stage or None,
+        "document_kind": filters.kind or None,
+        "retryable": (
+            True if filters.retryable == "yes"
+            else False if filters.retryable == "no"
+            else None
+        ),
+        "error_class": filters.error_class or None,
+        "anomaly_type": filters.anomaly_type or None,
+        "severity": filters.severity or None,
+        "unresolved_only": not filters.include_resolved,
+    }
+
+
+def _csv_response(
+    runtime: Runtime,
+    sql: str,
+    params: list[Any],
+    filename: str,
+) -> Response:
+    response = Response(
+        stream_with_context(stream_query_csv(runtime.database, sql, params)),
+        mimetype="text/csv",
+    )
+    response.headers["Content-Disposition"] = f'attachment; filename="{filename}"'
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    return response
+
+
+def _disk_free(path: str | Path) -> int:
+    try:
+        return int(shutil.disk_usage(Path(path)).free)
+    except OSError:
+        return 0
+
+
 def _pagination(
     page: int,
     has_next: bool,
     args: Mapping[str, Any],
     *,
     total: int | None = None,
+    page_key: str = "page",
 ) -> SimpleNamespace:
-    values = {key: value for key, value in args.items() if key != "page"}
-    previous_url = "?" + urlencode({**values, "page": page - 1}) if page > 1 else None
-    next_url = "?" + urlencode({**values, "page": page + 1}) if has_next else None
+    values = {key: value for key, value in args.items() if key != page_key}
+    previous_url = "?" + urlencode({**values, page_key: page - 1}) if page > 1 else None
+    next_url = "?" + urlencode({**values, page_key: page + 1}) if has_next else None
     pages = math.ceil(total / PAGE_SIZE) if total is not None and total else None
     return SimpleNamespace(
         page=page,
@@ -729,7 +1363,7 @@ def _pagination(
 
 def _page_number(value: str | None) -> int:
     try:
-        return max(1, int(value or 1))
+        return min(1_000_000, max(1, int(value or 1)))
     except ValueError:
         return 1
 

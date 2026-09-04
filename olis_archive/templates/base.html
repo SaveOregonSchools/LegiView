@@ -19,6 +19,8 @@
       <div class="header-actions">
         <nav class="nav-links" aria-label="Main navigation">
           <a{% if request.endpoint == 'home' %} class="active"{% endif %} href="{{ url_for('home') }}">Home</a>
+          <a{% if request.endpoint in ['bills', 'documents', 'session_status'] %} class="active"{% endif %} href="{{ url_for('session_status') }}">Archive</a>
+          <a{% if request.endpoint in ['runs', 'run_detail', 'operations', 'retry_failures'] %} class="active"{% endif %} href="{{ url_for('operations') }}">Operations</a>
           <a{% if request.endpoint == 'help_page' %} class="active"{% endif %} href="{{ url_for('help_page') }}">Help</a>
           <a{% if request.endpoint == 'settings' %} class="active"{% endif %} href="{{ url_for('settings') }}">Settings</a>
         </nav>

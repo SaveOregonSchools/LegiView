@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 
 def create_app(config_overrides: dict | None = None):
@@ -13,4 +13,3 @@ def create_app(config_overrides: dict | None = None):
 
 
 __all__ = ["__version__", "create_app"]
-

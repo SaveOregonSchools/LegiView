@@ -7,7 +7,7 @@
     <div>
       <p class="eyebrow">Operations</p>
       <h2>Retry Failed Downloads</h2>
-      <p class="heading-summary">Queue only retryable, interrupted, or missing-local document work. Valid completed files remain untouched.</p>
+      <p class="heading-summary">Queue retryable, interrupted, or missing-local work. Terminal failures remain available only for a deliberate operator-selected retry. Valid completed files remain untouched.</p>
     </div>
     <a class="button-link" href="{{ url_for('runs') }}">Run history</a>
   </section>
@@ -34,22 +34,27 @@
       <form method="post" action="{{ url_for('retry_failures') }}">
         <input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
         {% if filters.run_id %}<input type="hidden" name="run_id" value="{{ filters.run_id }}">{% endif %}
+        {% if filters.session %}<input type="hidden" name="session" value="{{ filters.session }}">{% endif %}
+        {% if filters.bill %}<input type="hidden" name="bill" value="{{ filters.bill }}">{% endif %}
+        <input type="hidden" name="page" value="{{ pagination.page }}">
         <div class="table-scroll"><table>
           <thead><tr><th class="check-column"><span class="visually-hidden">Select</span></th><th>Session / Bill</th><th>Document</th><th>Status</th><th>Attempts</th><th>Last error</th><th>Last attempt</th></tr></thead>
           <tbody>{% for row in rows %}<tr>
-            <td><input type="checkbox" name="document_ids" value="{{ row.id }}" aria-label="Select document {{ row.id }}" {% if row.retryable is not sameas false %}checked{% else %}disabled{% endif %}></td>
+            <td><input type="checkbox" name="document_ids" value="{{ row.id }}" aria-label="Select document {{ row.id }}" {% if row.download_status != 'failed_terminal' %}checked{% endif %}></td>
             <td>{{ row.session_key }}<div>{{ row.bill_id_display or row.bill_id_compact }}</div></td>
             <td><a class="record-link" href="{{ url_for('document_detail', document_id=row.id) }}">{{ row.title or row.remote_filename or 'Document #' ~ row.id }}</a><div class="table-note">{{ (row.document_kind or 'unknown')|replace('_', ' ') }}</div></td>
-            <td><span class="status {{ row.download_status }}">{{ (row.download_status or 'unknown')|replace('_', ' ') }}</span></td>
+            <td><span class="status {{ row.download_status }}">{{ (row.download_status or 'unknown')|replace('_', ' ') }}</span>{% if row.download_status == 'failed_terminal' %}<div class="table-note">Explicit selection required</div>{% endif %}</td>
             <td>{{ row.attempt_count or 0 }}</td>
             <td class="error-text">{{ row.last_error or '—' }}{% if row.http_status %}<div class="table-note">HTTP {{ row.http_status }}</div>{% endif %}</td>
             <td>{{ row.last_attempt_at or '—' }}</td>
           </tr>{% endfor %}</tbody>
         </table></div>
-        <div class="form-actions retry-actions"><button type="submit" name="action" value="selected">Queue selected retries</button><button class="secondary" type="submit" name="action" value="all">Queue all matching failures</button></div>
+        <div class="form-actions retry-actions"><button type="submit" name="action" value="selected">Queue selected retries</button><button class="secondary" type="submit" name="action" value="all">Queue all matching failures</button><a class="button-link" href="{{ url_for('download_archive') }}">Bulk retry by session</a></div>
+        <p class="field-note">“Queue all matching failures” is an explicit retry of every filtered row, including any terminal failures shown above.</p>
       </form>
+      <nav class="pagination" aria-label="Retry result pages">{% if pagination.prev_url %}<a class="button-link" href="{{ pagination.prev_url }}">Previous</a>{% endif %}<span>Page {{ pagination.page }}{% if pagination.pages %} of {{ pagination.pages }}{% endif %} · {{ pagination.total or 0 }} documents</span>{% if pagination.next_url %}<a class="button-link" href="{{ pagination.next_url }}">Next</a>{% endif %}</nav>
     {% else %}
-      <div class="empty-state"><strong>No retryable documents match these filters.</strong><p>Completed documents are intentionally excluded.</p></div>
+      <div class="empty-state"><strong>No failed or interrupted documents match these filters.</strong><p>Completed documents are intentionally excluded.</p></div>
     {% endif %}
   </section>
 {% endblock %}

@@ -9,7 +9,7 @@
       <h2>Browse Documents</h2>
       <p class="heading-summary">Filter discovered source records and inspect the retained file version and provenance.</p>
     </div>
-    <a class="button-link" href="{{ url_for('retry_failures') }}">Retry failures</a>
+    <div class="action-row"><a class="button-link" href="{{ url_for('retry_failures') }}">Retry failures</a><a class="button-link" href="{{ url_for('export_documents', session=filters.session, bill=filters.bill, kind=filters.kind, committee=filters.committee, submitter=filters.submitter, organization=filters.organization, position=filters.position, download_status=filters.download_status, source_presence=filters.source_presence, displayed_in_olis=filters.displayed_in_olis, failed_only='1' if filters.failed_only else '') }}">Export filtered CSV</a></div>
   </section>
 
   <section class="tool-surface accent-browse">
@@ -19,8 +19,11 @@
       <div><label for="kind">Document kind</label><select id="kind" name="kind"><option value="">All kinds</option>{% for kind in document_kinds %}<option value="{{ kind.value or kind }}" {% if filters.kind == (kind.value or kind) %}selected{% endif %}>{{ kind.label or (kind.value or kind)|replace('_', ' ')|title }}</option>{% endfor %}</select></div>
       <div><label for="committee">Committee</label><input id="committee" name="committee" value="{{ filters.committee or '' }}" placeholder="Rules or SRULES"></div>
       <div><label for="submitter">Submitter</label><input id="submitter" name="submitter" value="{{ filters.submitter or '' }}"></div>
+      <div><label for="organization">Organization / city</label><input id="organization" name="organization" value="{{ filters.organization or '' }}"></div>
       <div><label for="position">Position</label><select id="position" name="position"><option value="">All positions</option>{% for value in ['Support', 'Oppose', 'Neutral'] %}<option value="{{ value }}" {% if filters.position == value %}selected{% endif %}>{{ value }}</option>{% endfor %}</select></div>
       <div><label for="download_status">Download state</label><select id="download_status" name="download_status"><option value="">All states</option>{% for value in download_statuses %}<option value="{{ value.value or value }}" {% if filters.download_status == (value.value or value) %}selected{% endif %}>{{ value.label or (value.value or value)|replace('_', ' ')|title }}</option>{% endfor %}</select></div>
+      <div><label for="source_presence">Source presence</label><select id="source_presence" name="source_presence"><option value="">All states</option>{% for value in ['active','missing','unknown'] %}<option value="{{ value }}" {% if filters.source_presence == value %}selected{% endif %}>{{ value|title }}</option>{% endfor %}</select></div>
+      <div><label for="displayed_in_olis">Displayed in OLIS</label><select id="displayed_in_olis" name="displayed_in_olis"><option value="">Any / not applicable</option><option value="yes" {% if filters.displayed_in_olis == 'yes' %}selected{% endif %}>Yes</option><option value="no" {% if filters.displayed_in_olis == 'no' %}selected{% endif %}>No</option><option value="unknown" {% if filters.displayed_in_olis == 'unknown' %}selected{% endif %}>Unknown / unchecked</option></select></div>
       <div class="checkbox-field"><input id="failed_only" name="failed_only" type="checkbox" value="1" {% if filters.failed_only %}checked{% endif %}><label for="failed_only">Failed only</label></div>
       <div class="form-actions full"><button type="submit">Apply filters</button><a class="button-link" href="{{ url_for('documents') }}">Clear</a></div>
     </form>
@@ -30,7 +33,7 @@
     <div class="section-heading-row"><h2>Documents</h2><span class="status-note">{{ pagination.total or rows|length or 0 }} result{% if (pagination.total or rows|length or 0) != 1 %}s{% endif %}</span></div>
     {% if rows %}
       <div class="table-scroll"><table>
-        <thead><tr><th>Session / Bill</th><th>Kind</th><th>Title</th><th>Submitter</th><th>Committee / Date</th><th>Position</th><th>Download</th><th>Bytes</th></tr></thead>
+        <thead><tr><th>Session / Bill</th><th>Kind</th><th>Title</th><th>Submitter</th><th>Committee / Date</th><th>Position</th><th>Presence / OLIS</th><th>Download</th><th>Bytes</th></tr></thead>
         <tbody>{% for row in rows %}<tr>
           <td>{{ row.session_key }}<div><a href="{{ url_for('bill_detail', bill_id=row.bill_pk or row.bill_id) }}">{{ row.bill_id_display or row.bill_id_compact }}</a></div></td>
           <td>{{ (row.document_kind or 'unknown')|replace('_', ' ')|title }}</td>
@@ -38,8 +41,9 @@
           <td>{{ row.submitter or '—' }}{% if row.on_behalf_of %}<div class="table-note">For {{ row.on_behalf_of }}</div>{% endif %}</td>
           <td>{{ row.committee_name or row.committee_code or '—' }}<div class="table-note">{{ row.meeting_date or row.letter_date or '' }}</div></td>
           <td>{% if row.position %}<span class="position {{ row.position|lower }}">{{ row.position }}</span>{% else %}—{% endif %}</td>
+          <td><span class="status {{ row.source_presence or 'unknown' }}">{{ row.source_presence or 'unknown' }}</span><div class="table-note">OLIS: {% if row.displayed_in_olis is sameas true or row.displayed_in_olis == 1 %}displayed{% elif row.displayed_in_olis is sameas false or row.displayed_in_olis == 0 %}not displayed{% else %}unknown / N/A{% endif %}</div></td>
           <td><span class="status {{ row.download_status }}">{{ (row.download_status or 'unknown')|replace('_', ' ') }}</span>{% if row.last_error %}<div class="table-note error-text">{{ row.last_error }}</div>{% endif %}</td>
-          <td>{{ row.downloaded_bytes or row.byte_count or '—' }}</td>
+          <td>{% if row.downloaded_bytes is not none %}{{ row.downloaded_bytes|human_bytes }}{% elif row.probed_bytes is not none %}{{ row.probed_bytes|human_bytes }}<div class="table-note">remote probe</div>{% else %}—{% endif %}</td>
         </tr>{% endfor %}</tbody>
       </table></div>
       {% set prev_url = pagination.prev_url or pagination.previous_url %}

@@ -5,20 +5,25 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
+import http.client
 import json
 import logging
+import posixpath
 import threading
 import time
 from typing import Any, Callable, Iterator, Mapping
+import urllib.request
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode, urljoin, urlsplit
-from urllib.request import Request, urlopen
+from urllib.parse import unquote, urlencode, urljoin, urlsplit
+from urllib.request import Request
 
-from ..config import ODATA_BASE_URL
+from ..config import DEFAULT_USER_AGENT, ODATA_BASE_URL
 
 
 LOGGER = logging.getLogger(__name__)
 TRANSIENT_HTTP_STATUSES = {408, 425, 429, 500, 502, 503, 504}
+REDIRECT_HTTP_STATUSES = {301, 302, 303, 307, 308}
+DEFAULT_MAXIMUM_RESPONSE_BYTES = 32 * 1024 * 1024
 ENTITY_SETS = frozenset(
     {
         "LegislativeSessions",
@@ -65,6 +70,25 @@ class ODataPage:
 
 
 Transport = Callable[[str, Mapping[str, str], float], tuple[int, Mapping[str, str], bytes, str]]
+CancellationRequested = Callable[[], bool]
+_COOPERATIVE_SLEEP_SLICE_SECONDS = 0.25
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, request, response, code, message, headers, new_url):  # noqa: ANN001
+        return None
+
+
+def _normalized_url_path(path: str) -> str:
+    decoded = path
+    for _ in range(3):
+        expanded = unquote(decoded)
+        if expanded == decoded:
+            break
+        decoded = expanded
+    if "\x00" in decoded:
+        raise ValueError("URL path contained a null byte")
+    return posixpath.normpath(decoded.replace("\\", "/"))
 
 
 def odata_literal(value: str) -> str:
@@ -103,10 +127,13 @@ class ODataClient:
         base_url: str = ODATA_BASE_URL,
         *,
         timeout: float = 30.0,
-        user_agent: str = "OLISArchive/0.1 (+https://www.saveoregonschools.com/)",
+        user_agent: str = DEFAULT_USER_AGENT,
         max_attempts: int = 3,
         inter_request_delay: float = 0.25,
+        max_redirects: int = 8,
+        maximum_response_bytes: int = DEFAULT_MAXIMUM_RESPONSE_BYTES,
         transport: Transport | None = None,
+        opener=None,
         sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         self.base_url = base_url.rstrip("/") + "/"
@@ -114,6 +141,13 @@ class ODataClient:
         self.user_agent = user_agent
         self.max_attempts = max(1, int(max_attempts))
         self.inter_request_delay = max(0.0, float(inter_request_delay))
+        if max_redirects < 0:
+            raise ValueError("max_redirects cannot be negative")
+        if maximum_response_bytes <= 0:
+            raise ValueError("maximum_response_bytes must be positive")
+        self.max_redirects = int(max_redirects)
+        self.maximum_response_bytes = int(maximum_response_bytes)
+        self._opener = opener or urllib.request.build_opener(_NoRedirect())
         self.transport = transport or self._default_transport
         self.sleep = sleep
         self._request_lock = threading.Lock()
@@ -121,42 +155,195 @@ class ODataClient:
         parsed = urlsplit(self.base_url)
         if parsed.scheme not in {"http", "https"} or not parsed.hostname:
             raise ValueError("OData base URL must be an absolute HTTP(S) URL")
+        if parsed.username is not None or parsed.password is not None:
+            raise ValueError("OData base URL must not contain credentials")
         self._base_scheme = parsed.scheme.casefold()
-        self._base_host = parsed.hostname.casefold()
+        self._base_host = parsed.hostname.casefold().rstrip(".")
+        try:
+            self._base_port = parsed.port or (443 if self._base_scheme == "https" else 80)
+        except ValueError as exc:
+            raise ValueError("OData base URL contains an invalid port") from exc
         self._base_path = parsed.path.rstrip("/") + "/"
+        self._base_normalized_path = _normalized_url_path(parsed.path).rstrip("/")
 
     def _default_transport(
         self, url: str, headers: Mapping[str, str], timeout: float
     ) -> tuple[int, Mapping[str, str], bytes, str]:
-        request = Request(url, headers=dict(headers), method="GET")
-        with urlopen(request, timeout=timeout) as response:  # noqa: S310 - base/continuations validated
-            return (
-                int(response.status),
-                dict(response.headers.items()),
-                response.read(),
-                response.geturl(),
+        current = self._validated_url(url)
+        redirects_followed = 0
+        while True:
+            request = Request(current, headers=dict(headers), method="GET")
+            response = None
+            try:
+                try:
+                    response = self._opener.open(request, timeout=timeout)  # noqa: S310
+                except HTTPError as exc:
+                    status = int(exc.code)
+                    if status not in REDIRECT_HTTP_STATUSES:
+                        raise
+                    location = (exc.headers or {}).get("Location", "")
+                    exc.close()
+                    if not location:
+                        raise ODataResponseError(
+                            "OData redirect did not provide a Location header",
+                            url=current,
+                            status_code=status,
+                        ) from None
+                    if redirects_followed >= self.max_redirects:
+                        raise ODataResponseError(
+                            "OData maximum redirect count exceeded",
+                            url=current,
+                            status_code=status,
+                        ) from None
+                    # Validate before issuing the redirected request. The default
+                    # opener is deliberately unable to follow redirects itself.
+                    current = self._validated_url(urljoin(current, location))
+                    redirects_followed += 1
+                    continue
+
+                raw_status = getattr(response, "status", None)
+                status = int(raw_status if raw_status is not None else response.getcode())
+                response_headers = dict(response.headers.items())
+                if status in REDIRECT_HTTP_STATUSES:
+                    location = _header(response_headers, "Location") or ""
+                    if not location:
+                        raise ODataResponseError(
+                            "OData redirect did not provide a Location header",
+                            url=current,
+                            status_code=status,
+                        )
+                    if redirects_followed >= self.max_redirects:
+                        raise ODataResponseError(
+                            "OData maximum redirect count exceeded",
+                            url=current,
+                            status_code=status,
+                        )
+                    current = self._validated_url(urljoin(current, location))
+                    redirects_followed += 1
+                    continue
+
+                reported_url = self._validated_url(response.geturl())
+                if reported_url != current:
+                    raise ODataResponseError(
+                        "OData HTTP opener followed an unexpected redirect",
+                        url=reported_url,
+                        status_code=status,
+                    )
+                raw_length = _header(response_headers, "Content-Length")
+                if raw_length:
+                    try:
+                        content_length = int(raw_length)
+                    except ValueError as exc:
+                        raise ODataResponseError(
+                            "OData returned an invalid Content-Length header",
+                            url=current,
+                            status_code=status,
+                        ) from exc
+                    if content_length < 0:
+                        raise ODataResponseError(
+                            "OData returned a negative Content-Length header",
+                            url=current,
+                            status_code=status,
+                        )
+                    if content_length > self.maximum_response_bytes:
+                        raise ODataResponseError(
+                            "OData response exceeded the configured safety limit",
+                            url=current,
+                            status_code=status,
+                        )
+                payload = response.read(self.maximum_response_bytes + 1)
+                if len(payload) > self.maximum_response_bytes:
+                    raise ODataResponseError(
+                        "OData response exceeded the configured safety limit",
+                        url=current,
+                        status_code=status,
+                    )
+                return status, response_headers, payload, current
+            finally:
+                if response is not None:
+                    response.close()
+
+    def _raise_if_canceled(
+        self, url: str, cancellation_requested: CancellationRequested | None
+    ) -> None:
+        if cancellation_requested is not None and cancellation_requested():
+            raise ODataError(
+                "OData request interrupted by run control",
+                url=url,
+                retryable=True,
             )
 
-    def _throttle(self) -> None:
+    def _sleep_with_control(
+        self,
+        seconds: float,
+        *,
+        url: str,
+        cancellation_requested: CancellationRequested | None,
+    ) -> None:
+        duration = max(0.0, float(seconds))
+        if cancellation_requested is None:
+            # Preserve the original one-shot sleep for every existing caller.
+            self.sleep(duration)
+            return
+        remaining = duration
+        while remaining > 0:
+            self._raise_if_canceled(url, cancellation_requested)
+            interval = min(_COOPERATIVE_SLEEP_SLICE_SECONDS, remaining)
+            self.sleep(interval)
+            remaining -= interval
+        self._raise_if_canceled(url, cancellation_requested)
+
+    def _throttle(
+        self,
+        *,
+        url: str,
+        cancellation_requested: CancellationRequested | None = None,
+    ) -> None:
+        self._raise_if_canceled(url, cancellation_requested)
         if not self.inter_request_delay:
             return
         with self._request_lock:
             now = time.monotonic()
             remaining = self.inter_request_delay - (now - self._last_request_monotonic)
             if remaining > 0:
-                self.sleep(remaining)
+                self._sleep_with_control(
+                    remaining,
+                    url=url,
+                    cancellation_requested=cancellation_requested,
+                )
             self._last_request_monotonic = time.monotonic()
 
     def _validated_url(self, url: str) -> str:
         absolute = urljoin(self.base_url, url)
         parsed = urlsplit(absolute)
-        if parsed.scheme.casefold() != self._base_scheme or (parsed.hostname or "").casefold() != self._base_host:
+        try:
+            port = parsed.port or (443 if parsed.scheme.casefold() == "https" else 80)
+        except ValueError as exc:
+            raise ODataResponseError("OData URL contains an invalid port", url=absolute) from exc
+        if parsed.username is not None or parsed.password is not None:
+            raise ODataResponseError("OData URL contained embedded credentials", url=absolute)
+        if (
+            parsed.scheme.casefold() != self._base_scheme
+            or (parsed.hostname or "").casefold().rstrip(".") != self._base_host
+            or port != self._base_port
+        ):
             raise ODataResponseError("OData continuation left the configured service host", url=absolute)
-        if not parsed.path.casefold().startswith(self._base_path.casefold()):
+        try:
+            normalized_path = _normalized_url_path(parsed.path)
+        except ValueError as exc:
+            raise ODataResponseError("OData URL contained an invalid path", url=absolute) from exc
+        expected_path = self._base_normalized_path.casefold()
+        candidate_path = normalized_path.casefold()
+        if candidate_path != expected_path and not candidate_path.startswith(expected_path + "/"):
             raise ODataResponseError("OData continuation left the configured service path", url=absolute)
         return absolute
 
-    def request_json(self, url: str) -> tuple[dict[str, Any], Mapping[str, str], str]:
+    def request_json(
+        self,
+        url: str,
+        *,
+        cancellation_requested: CancellationRequested | None = None,
+    ) -> tuple[dict[str, Any], Mapping[str, str], str]:
         validated = self._validated_url(url)
         headers = {
             "Accept": "application/json",
@@ -166,7 +353,7 @@ class ODataClient:
         }
         last_error: ODataError | None = None
         for attempt in range(1, self.max_attempts + 1):
-            self._throttle()
+            self._throttle(url=validated, cancellation_requested=cancellation_requested)
             try:
                 status, response_headers, payload, final_url = self.transport(
                     validated, headers, self.timeout
@@ -179,6 +366,12 @@ class ODataClient:
                         status_code=status,
                         retryable=status in TRANSIENT_HTTP_STATUSES,
                         retry_after=retry_after,
+                    )
+                if len(payload) > self.maximum_response_bytes:
+                    raise ODataResponseError(
+                        "OData response exceeded the configured safety limit",
+                        url=validated,
+                        status_code=status,
                     )
                 final_validated = self._validated_url(final_url)
                 try:
@@ -194,12 +387,20 @@ class ODataClient:
                 return decoded, response_headers, final_validated
             except HTTPError as exc:
                 retryable = exc.code in TRANSIENT_HTTP_STATUSES
+                response_headers = exc.headers or {}
                 last_error = ODataError(
                     f"OData returned HTTP {exc.code}",
                     url=validated,
                     status_code=exc.code,
                     retryable=retryable,
-                    retry_after=parse_retry_after(exc.headers.get("Retry-After")),
+                    retry_after=parse_retry_after(response_headers.get("Retry-After")),
+                )
+                exc.close()
+            except http.client.IncompleteRead:
+                last_error = ODataError(
+                    "OData response ended before the advertised payload was complete",
+                    url=validated,
+                    retryable=True,
                 )
             except (URLError, TimeoutError, OSError) as exc:
                 last_error = ODataError(
@@ -211,8 +412,93 @@ class ODataClient:
                 raise last_error
             delay = max(float(2 ** (attempt - 1)), float(last_error.retry_after or 0))
             LOGGER.warning("Retrying OData request in %.1fs after %s", delay, last_error)
-            self.sleep(min(delay, 3600.0))
+            self._sleep_with_control(
+                min(delay, 3600.0),
+                url=validated,
+                cancellation_requested=cancellation_requested,
+            )
         raise last_error or ODataError("OData request failed", url=validated)
+
+    def get_metadata_xml(
+        self,
+        *,
+        cancellation_requested: CancellationRequested | None = None,
+    ) -> tuple[str, Mapping[str, str], str]:
+        """Fetch the official service metadata with normal safety/retry rules."""
+
+        validated = self._validated_url("$metadata")
+        headers = {
+            "Accept": "application/xml, text/xml",
+            "User-Agent": self.user_agent,
+            "DataServiceVersion": "3.0",
+            "MaxDataServiceVersion": "3.0",
+        }
+        last_error: ODataError | None = None
+        for attempt in range(1, self.max_attempts + 1):
+            self._throttle(url=validated, cancellation_requested=cancellation_requested)
+            try:
+                status, response_headers, payload, final_url = self.transport(
+                    validated, headers, self.timeout
+                )
+                if status < 200 or status >= 300:
+                    retry_after = parse_retry_after(_header(response_headers, "Retry-After"))
+                    raise ODataError(
+                        f"OData metadata returned HTTP {status}",
+                        url=validated,
+                        status_code=status,
+                        retryable=status in TRANSIENT_HTTP_STATUSES,
+                        retry_after=retry_after,
+                    )
+                if len(payload) > self.maximum_response_bytes:
+                    raise ODataResponseError(
+                        "OData metadata exceeded the configured safety limit",
+                        url=validated,
+                        status_code=status,
+                    )
+                final_validated = self._validated_url(final_url)
+                try:
+                    text = payload.decode("utf-8-sig")
+                except UnicodeDecodeError as exc:
+                    raise ODataResponseError(
+                        "OData metadata was not valid UTF-8",
+                        url=validated,
+                        status_code=status,
+                    ) from exc
+                return text, response_headers, final_validated
+            except HTTPError as exc:
+                response_headers = exc.headers or {}
+                last_error = ODataError(
+                    f"OData metadata returned HTTP {exc.code}",
+                    url=validated,
+                    status_code=exc.code,
+                    retryable=exc.code in TRANSIENT_HTTP_STATUSES,
+                    retry_after=parse_retry_after(response_headers.get("Retry-After")),
+                )
+                exc.close()
+            except http.client.IncompleteRead:
+                last_error = ODataError(
+                    "OData metadata response ended before the advertised payload was complete",
+                    url=validated,
+                    retryable=True,
+                )
+            except (URLError, TimeoutError, OSError) as exc:
+                last_error = ODataError(
+                    f"OData metadata request failed: {exc}",
+                    url=validated,
+                    retryable=True,
+                )
+            except ODataError as exc:
+                last_error = exc
+            if not last_error.retryable or attempt >= self.max_attempts:
+                raise last_error
+            delay = max(float(2 ** (attempt - 1)), float(last_error.retry_after or 0))
+            LOGGER.warning("Retrying OData metadata in %.1fs after %s", delay, last_error)
+            self._sleep_with_control(
+                min(delay, 3600.0),
+                url=validated,
+                cancellation_requested=cancellation_requested,
+            )
+        raise last_error or ODataError("OData metadata request failed", url=validated)
 
     def build_url(self, entity_set: str, **params: Any) -> str:
         if entity_set not in ENTITY_SETS:
@@ -251,7 +537,13 @@ class ODataClient:
         metadata = payload.get("odata.metadata") or payload.get("@odata.context")
         return ODataPage(tuple(dict(item) for item in raw_items), next_url, count, str(metadata) if metadata else None)
 
-    def iter_pages(self, entity_set: str, **params: Any) -> Iterator[ODataPage]:
+    def iter_pages(
+        self,
+        entity_set: str,
+        *,
+        cancellation_requested: CancellationRequested | None = None,
+        **params: Any,
+    ) -> Iterator[ODataPage]:
         url: str | None = self.build_url(entity_set, **params)
         visited: set[str] = set()
         while url:
@@ -260,7 +552,10 @@ class ODataClient:
             if len(visited) >= 10_000:
                 raise ODataResponseError("OData page limit exceeded", url=url)
             visited.add(url)
-            payload, _, final_url = self.request_json(url)
+            payload, _, final_url = self.request_json(
+                url,
+                cancellation_requested=cancellation_requested,
+            )
             page = self.parse_page(payload, final_url)
             yield page
             url = page.next_url

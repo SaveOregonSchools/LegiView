@@ -29,7 +29,7 @@ import urllib.error
 from urllib.parse import unquote, urljoin, urlsplit
 import urllib.request
 
-from ..config import DEFAULT_ALLOWED_DOWNLOAD_HOSTS
+from ..config import DEFAULT_ALLOWED_DOWNLOAD_HOSTS, DEFAULT_USER_AGENT
 from .archive_paths import (
     ArchivePathCollision,
     collision_safe_destination,
@@ -49,12 +49,12 @@ from .file_types import (
 from .hashing import sha256_file
 
 
-DEFAULT_USER_AGENT = "LegiView/0.1 (local Oregon legislative archive)"
 SAFE_RESPONSE_HEADERS = frozenset(
     {
         "content-type",
         "content-length",
         "content-disposition",
+        "content-range",
         "etag",
         "last-modified",
         "accept-ranges",
@@ -211,6 +211,8 @@ class SafeHTTPClient:
         user_agent: str = DEFAULT_USER_AGENT,
         allow_private_network: bool = False,
         allow_https_downgrade: bool = False,
+        require_https: bool = False,
+        allowed_ports: Collection[int] | None = None,
         resolver: Callable = socket.getaddrinfo,
         opener=None,
     ) -> None:
@@ -227,6 +229,16 @@ class SafeHTTPClient:
         self.user_agent = user_agent
         self.allow_private_network = allow_private_network
         self.allow_https_downgrade = allow_https_downgrade
+        self.require_https = bool(require_https)
+        self.allowed_ports = (
+            frozenset(int(port) for port in allowed_ports)
+            if allowed_ports is not None
+            else None
+        )
+        if self.allowed_ports is not None and any(
+            port < 1 or port > 65535 for port in self.allowed_ports
+        ):
+            raise ValueError("allowed_ports must contain valid TCP ports")
         self.resolver = resolver
         self.opener = opener or urllib.request.build_opener(
             _NoRedirect(),
@@ -245,7 +257,6 @@ class SafeHTTPClient:
         redirects: list[str] = []
         response = None
         request_headers = _safe_request_headers(headers or {})
-        original_scheme = urlsplit(url).scheme.casefold()
         try:
             for _ in range(self.max_redirects + 1):
                 self.validate_target(current)
@@ -259,8 +270,9 @@ class SafeHTTPClient:
                     response = self.opener.open(request, timeout=self.timeout_seconds)
                 except urllib.error.HTTPError as exc:
                     status = int(exc.code)
+                    response_headers = exc.headers or {}
                     if status in REDIRECT_STATUSES:
-                        location = exc.headers.get("Location", "")
+                        location = response_headers.get("Location", "")
                         exc.close()
                         if not location:
                             raise DownloadError(
@@ -269,14 +281,13 @@ class SafeHTTPClient:
                                 code="invalid_redirect",
                             ) from None
                         destination = urljoin(current, location)
-                        parsed_destination = urlsplit(destination)
                         if (
-                            original_scheme == "https"
-                            and parsed_destination.scheme.casefold() == "http"
+                            _url_origin(current)[0] == "https"
+                            and _url_origin(destination)[0] == "http"
                             and not self.allow_https_downgrade
                         ):
                             raise UnsafeDownloadTarget("HTTPS-to-HTTP redirects are blocked.")
-                        if urlsplit(current).hostname != parsed_destination.hostname:
+                        if _url_origin(current) != _url_origin(destination):
                             request_headers = {
                                 key: value
                                 for key, value in request_headers.items()
@@ -288,7 +299,7 @@ class SafeHTTPClient:
                             raise DownloadError("Maximum redirect count exceeded.", code="too_many_redirects")
                         continue
                     retryable = status in RETRYABLE_HTTP_STATUSES or 500 <= status <= 599
-                    retry_after = retry_after_seconds(exc.headers.get("Retry-After"))
+                    retry_after = retry_after_seconds(response_headers.get("Retry-After"))
                     exc.close()
                     raise NetworkDownloadError(
                         f"Remote server returned HTTP {status}.",
@@ -304,6 +315,12 @@ class SafeHTTPClient:
                         code="network_error",
                     ) from None
 
+                reported_url = str(response.geturl())
+                self.validate_target(reported_url)
+                if reported_url != current:
+                    raise UnsafeDownloadTarget(
+                        "HTTP opener followed an unexpected redirect before target validation."
+                    )
                 self._validate_headers(response.headers)
                 raw_status = getattr(response, "status", None)
                 if raw_status is None:
@@ -340,8 +357,23 @@ class SafeHTTPClient:
         scheme = parsed.scheme.casefold()
         if scheme not in {"http", "https"} or not parsed.hostname:
             raise UnsafeDownloadTarget("Only absolute HTTP and HTTPS URLs are allowed.")
+        if self.require_https and scheme != "https":
+            raise UnsafeDownloadTarget("This download source requires HTTPS.")
+        if self.allowed_ports is not None and port not in self.allowed_ports:
+            raise UnsafeDownloadTarget(f"Download port is not allowed: {port}")
         if parsed.username is not None or parsed.password is not None:
             raise UnsafeDownloadTarget("Credentials embedded in download URLs are blocked.")
+        decoded_path = parsed.path
+        for _ in range(3):
+            expanded = unquote(decoded_path)
+            if expanded == decoded_path:
+                break
+            decoded_path = expanded
+        if "\x00" in decoded_path or any(
+            segment in {".", ".."}
+            for segment in decoded_path.replace("\\", "/").split("/")
+        ):
+            raise UnsafeDownloadTarget("Encoded or explicit path traversal is blocked.")
         host = parsed.hostname.casefold().rstrip(".")
         if not _host_is_allowed(host, self.allowed_hosts):
             raise UnsafeDownloadTarget(f"Download host is not on the expected-host allowlist: {host}")
@@ -470,6 +502,8 @@ class Downloader:
         chunk_size: int = 1024 * 1024,
         maximum_download_bytes: int | None = None,
         allow_private_network: bool = False,
+        require_https: bool = False,
+        allowed_ports: Collection[int] | None = None,
         client: SafeHTTPClient | None = None,
     ) -> None:
         if chunk_size <= 0:
@@ -484,6 +518,8 @@ class Downloader:
             max_redirects=max_redirects,
             user_agent=user_agent,
             allow_private_network=allow_private_network,
+            require_https=require_https,
+            allowed_ports=allowed_ports,
         )
         self.minimum_free_space_bytes = int(minimum_free_space_bytes)
         self.chunk_size = int(chunk_size)
@@ -516,13 +552,31 @@ class Downloader:
         # source.  This deliberately happens before examining the destination.
         self.client.validate_target(url)
         if destination_path.exists():
-            return self._validated_existing_result(
+            if expected_sha256.strip():
+                return self._validated_existing_result(
+                    url,
+                    destination_path,
+                    root,
+                    expected_mime_type=expected_mime_type,
+                    expected_length=expected_length,
+                    expected_sha256=expected_sha256,
+                )
+            # A process can stop after atomic promotion but before the database
+            # records the hash. Redownload into the normal exclusive `.part`
+            # path and let `_transfer` byte/hash-compare it with the existing
+            # destination. Matching bytes are safely adopted; differing bytes
+            # remain a non-overwriting conflict.
+            return self._transfer(
                 url,
-                destination_path,
                 root,
+                fixed_destination=destination_path,
+                headers=headers,
                 expected_mime_type=expected_mime_type,
                 expected_length=expected_length,
                 expected_sha256=expected_sha256,
+                cancellation_requested=cancellation_requested,
+                correct_extension=correct_extension,
+                allow_collision_suffix=False,
             )
         return self._transfer(
             url,
@@ -998,6 +1052,22 @@ def _host_is_allowed(host: str, allowed_hosts: Collection[str]) -> bool:
         elif host == allowed:
             return True
     return False
+
+
+def _url_origin(url: str) -> tuple[str, str, int | None]:
+    parsed = urlsplit(url)
+    scheme = parsed.scheme.casefold()
+    host = (parsed.hostname or "").casefold().rstrip(".")
+    try:
+        port = parsed.port
+    except ValueError:
+        port = None
+    if port is None:
+        if scheme == "https":
+            port = 443
+        elif scheme == "http":
+            port = 80
+    return scheme, host, port
 
 
 def _safe_request_headers(headers: Mapping[str, str]) -> dict[str, str]:

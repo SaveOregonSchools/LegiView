@@ -8,7 +8,7 @@
       <p class="eyebrow">Local legislative archive</p>
       <h2>LegiView Home</h2>
     </div>
-    <p class="status-note">Collect an individual bill first, then browse its official metadata and retained documents.</p>
+    <p class="status-note">Build a durable historical inventory, then explicitly acquire the payloads you choose.</p>
   </section>
 
   <section class="module-columns" aria-label="LegiView modules">
@@ -20,6 +20,14 @@
         </div>
         <p class="module-intro">Start durable, resumable collection work for an explicitly selected Oregon legislative bill or session.</p>
         <div class="module-list">
+          <div class="module-row">
+            <a class="module-button" href="{{ url_for('inventory_backfill') }}">Inventory Backfill</a>
+            <div class="description">Resolve every official session at or after 2014R1, catalog HB/SB records, and reconcile document discovery without downloading payloads.</div>
+          </div>
+          <div class="module-row">
+            <a class="module-button" href="{{ url_for('download_archive') }}">Download Archive</a>
+            <div class="description">Preview a frozen inventoried scope, disk protection, and known-size lower bound before explicitly starting downloads.</div>
+          </div>
           <div class="module-row">
             <a class="module-button" href="{{ url_for('collect_bill') }}">Collect a Bill</a>
             <div class="description">Retrieve one HB or SB, its sponsors and committee context, then archive every discovered in-scope document.</div>
@@ -46,6 +54,10 @@
             <a class="module-button" href="{{ url_for('retry_failures') }}">Retry Failures</a>
             <div class="description">Requeue failed or interrupted downloads without replacing valid archived payloads.</div>
           </div>
+          <div class="module-row">
+            <a class="module-button" href="{{ url_for('operations') }}">Failures / Anomalies</a>
+            <div class="description">Review source/query failures, terminal payloads, display mismatches, parser anomalies, and source type drift.</div>
+          </div>
         </div>
       </section>
     </div>
@@ -58,6 +70,10 @@
         </div>
         <p class="module-intro">Explore normalized bill metadata and document provenance without issuing another source request.</p>
         <div class="module-list">
+          <div class="module-row">
+            <a class="module-button" href="{{ url_for('session_status') }}">Session Status</a>
+            <div class="description">Compare HB/SB totals, document kinds, completeness, failures, probed size, and archive activity by session.</div>
+          </div>
           <div class="module-row">
             <a class="module-button" href="{{ url_for('bills') }}">Browse Bills</a>
             <div class="description">Filter collected House and Senate bills by session, chamber, identifier, or enactment.</div>
@@ -82,7 +98,7 @@
           </div>
           <div class="module-row">
             <a class="module-button" href="{{ url_for('help_page') }}">Help / Data Sources</a>
-            <div class="description">Read the collection workflow, Oregon Legislature acceptable-use requirements, and Phase 1 limits.</div>
+            <div class="description">Read the collection workflow, Oregon Legislature acceptable-use requirements, completeness rules, and recovery behavior.</div>
           </div>
         </div>
       </section>
@@ -92,19 +108,25 @@
   <section class="content-section home-status-section">
     <div class="section-heading-row"><h2>At a Glance</h2><span class="status-note">Current local database and archive</span></div>
     <div class="stat-grid stat-grid-eight" aria-label="Archive status">
-      <div class="stat"><span class="stat-label">Sessions stored</span><strong>{{ stats.sessions or 0 }}</strong></div>
-      <div class="stat"><span class="stat-label">Bills stored</span><strong>{{ stats.bills or 0 }}</strong></div>
-      <div class="stat"><span class="stat-label">Sponsors stored</span><strong>{{ stats.sponsors or 0 }}</strong></div>
+      <div class="stat"><span class="stat-label">Sessions in scope</span><strong>{{ stats.sessions or 0 }}</strong></div>
+      <div class="stat"><span class="stat-label">Sessions inventory complete</span><strong>{{ stats.sessions_complete or 0 }}</strong></div>
+      <div class="stat"><span class="stat-label">Bills cataloged</span><strong>{{ stats.bills or 0 }}</strong></div>
       <div class="stat"><span class="stat-label">Documents discovered</span><strong>{{ stats.documents_discovered or 0 }}</strong></div>
-      <div class="stat"><span class="stat-label">Documents downloaded</span><strong>{{ stats.documents_downloaded or 0 }}</strong></div>
+      <div class="stat"><span class="stat-label">Public testimony</span><strong>{{ stats.public_testimony or 0 }}</strong></div>
+      <div class="stat"><span class="stat-label">Presentation / legacy</span><strong>{{ stats.presentation_legacy or 0 }}</strong></div>
+      <div class="stat"><span class="stat-label">Floor letters</span><strong>{{ stats.floor_letters or 0 }}</strong></div>
+      <div class="stat"><span class="stat-label">Current payloads downloaded</span><strong>{{ stats.documents_downloaded or 0 }}</strong></div>
       <div class="stat"><span class="stat-label">Download failures</span><strong>{{ stats.download_failures or 0 }}</strong></div>
-      <div class="stat"><span class="stat-label">Archive bytes</span><strong>{{ stats.archive_bytes or '0 B' }}</strong></div>
-      <div class="stat"><span class="stat-label">Last completed collection</span><strong class="stat-date">{{ stats.last_completed_collection or 'Not yet' }}</strong></div>
+      <div class="stat"><span class="stat-label">Local archive bytes</span><strong>{{ stats.archive_bytes or '0 B' }}</strong></div>
+      <div class="stat"><span class="stat-label">Remote sizes known / unknown</span><strong>{{ stats.known_size_documents or 0 }} / {{ stats.unknown_size_documents or 0 }}</strong></div>
+      <div class="stat"><span class="stat-label">Known remote bytes{% if stats.unknown_size_documents %} (lower bound){% endif %}</span><strong>{{ stats.known_remote_bytes or '0 B' }}</strong></div>
+      <div class="stat"><span class="stat-label">Disk free</span><strong>{{ stats.disk_free or '0 B' }}</strong></div>
+      <div class="stat"><span class="stat-label">Last historical inventory</span><strong class="stat-date">{{ stats.last_historical_inventory or 'Not yet' }}</strong></div>
     </div>
   </section>
 
   <section class="content-section">
-    <div class="section-heading-row"><h2>Recent Collection Runs</h2><a class="text-link" href="{{ url_for('runs') }}">All runs</a></div>
+    <div class="section-heading-row"><h2>Recent Runs</h2><a class="text-link" href="{{ url_for('runs') }}">All runs</a></div>
     {% if recent_runs %}
       <div class="table-scroll">
         <table>
@@ -126,7 +148,7 @@
         </table>
       </div>
     {% else %}
-      <div class="empty-state"><strong>No collection runs yet.</strong><p>Begin with <a href="{{ url_for('collect_bill') }}">Collect a Bill</a>.</p></div>
+      <div class="empty-state"><strong>No collection runs yet.</strong><p>Begin with <a href="{{ url_for('inventory_backfill') }}">Inventory Backfill</a> or a targeted <a href="{{ url_for('collect_bill') }}">bill collection</a>.</p></div>
     {% endif %}
   </section>
 {% endblock %}

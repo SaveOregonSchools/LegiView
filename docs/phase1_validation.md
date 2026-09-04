@@ -234,11 +234,11 @@ The application was started on `127.0.0.1:5055` for representative UI validation
 | CLI shared-service execution | Passed bill, session, show, rerun, and targeted retry validations. |
 | Complete automated suite | 91 passed, 2 environment-only skips, 0 failed in 15.75 seconds. |
 
-Known Phase 1 limitations remain as documented in the README: on-demand HB/SB scope,
-single-owner mutation rather than distributed workers, no scheduled all-history
-orchestration, no OCR/full-text/AI analysis, no antivirus, and source-change detection
-that relies primarily on official modification metadata. Reference data now uses
-verified inclusive CreatedDate/ModifiedDate watermarks; Phase 2 must extend durable
-incremental cursors across the full-history orchestrator. The zero-byte upstream
-testimony record is a known source-data/download discrepancy, not a silently accepted
-archive payload.
+At Phase 1 sign-off, the known limitations were on-demand HB/SB scope, single-owner
+mutation rather than distributed workers, no scheduled all-history orchestration, no
+OCR/full-text/AI analysis, no antivirus, and source-change detection that relied
+primarily on official modification metadata. Phase 2 subsequently extended the same
+run model with full-history inventory, per-entity durable cursors, completeness, and
+separate archive acquisition; see [phase2_validation.md](phase2_validation.md). The
+zero-byte upstream testimony record remains a known source-data/download discrepancy,
+not a silently accepted archive payload.

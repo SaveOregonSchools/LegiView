@@ -1,0 +1,76 @@
+{% extends "base.html" %}
+
+{% block title %}Operations Review - LegiView{% endblock %}
+
+{% block content %}
+  <section class="page-heading">
+    <div>
+      <p class="eyebrow">Failures and source diagnostics</p>
+      <h2>Operations Review</h2>
+      <p class="heading-summary">Distinguish payload failures from inventory-threatening source, parser, display, and type-drift anomalies.</p>
+    </div>
+    <div class="action-row">
+      <a class="button-link" href="{{ url_for('retry_failures') }}">Retry downloads</a>
+      <a class="button-link" href="{{ url_for('export_operations', view=filters.view, run=filters.run_id or '', session=filters.session, bill=filters.bill, stage=filters.stage, kind=filters.kind, retryable=filters.retryable, error_class=filters.error_class, anomaly_type=filters.anomaly_type, severity=filters.severity, include_resolved='1' if filters.include_resolved else '') }}">Export filtered CSV</a>
+    </div>
+  </section>
+
+  <nav class="subnav" aria-label="Operations views">
+    <a{% if filters.view == 'errors' %} class="active"{% endif %} href="{{ url_for('operations', view='errors') }}">Errors</a>
+    <a{% if filters.view == 'anomalies' %} class="active"{% endif %} href="{{ url_for('operations', view='anomalies') }}">Anomalies and type drift</a>
+  </nav>
+
+  <section class="tool-surface accent-operations">
+    <form method="get" action="{{ url_for('operations') }}" class="filter-form operations-filter-form">
+      <input type="hidden" name="view" value="{{ filters.view }}">
+      <div><label for="run">Run</label><input id="run" name="run" type="number" min="1" value="{{ filters.run_id or '' }}"></div>
+      <div><label for="session">Session</label><input id="session" name="session" value="{{ filters.session or '' }}" placeholder="2026R1"></div>
+      <div><label for="bill">Bill</label><input id="bill" name="bill" value="{{ filters.bill or '' }}" placeholder="SB1501"></div>
+      <div><label for="stage">Stage / source entity</label><input id="stage" name="stage" value="{{ filters.stage or '' }}" placeholder="sync_public_testimony"></div>
+      <div><label for="kind">Document kind</label><select id="kind" name="kind"><option value="">All kinds</option>{% for kind in document_kinds %}<option value="{{ kind }}" {% if filters.kind == kind %}selected{% endif %}>{{ kind|replace('_', ' ')|title }}</option>{% endfor %}</select></div>
+      {% if filters.view == 'errors' %}
+        <div><label for="retryable">Retryability</label><select id="retryable" name="retryable"><option value="">All</option><option value="yes" {% if filters.retryable == 'yes' %}selected{% endif %}>Retryable</option><option value="no" {% if filters.retryable == 'no' %}selected{% endif %}>Terminal</option></select></div>
+        <div><label for="error_class">HTTP / error class</label><input id="error_class" name="error_class" value="{{ filters.error_class or '' }}" placeholder="HTTPError"></div>
+      {% else %}
+        <div><label for="anomaly_type">Anomaly type</label><input id="anomaly_type" name="anomaly_type" value="{{ filters.anomaly_type or '' }}" placeholder="type_drift"></div>
+        <div><label for="severity">Severity</label><select id="severity" name="severity"><option value="">All severities</option>{% for value in ['info','warning','error','critical'] %}<option value="{{ value }}" {% if filters.severity == value %}selected{% endif %}>{{ value|title }}</option>{% endfor %}</select></div>
+      {% endif %}
+      <div class="checkbox-field"><input id="include_resolved" name="include_resolved" type="checkbox" value="1" {% if filters.include_resolved %}checked{% endif %}><label for="include_resolved">Include resolved</label></div>
+      <div class="form-actions full"><button type="submit">Apply filters</button><a class="button-link" href="{{ url_for('operations', view=filters.view) }}">Clear</a></div>
+    </form>
+  </section>
+
+  <section class="content-section">
+    <div class="section-heading-row"><h2>{{ 'Errors' if filters.view == 'errors' else 'Anomalies and Type Drift' }}</h2><span class="status-note">{{ pagination.total or 0 }} result{% if (pagination.total or 0) != 1 %}s{% endif %}</span></div>
+    {% if rows %}
+      <div class="table-scroll"><table>
+        {% if filters.view == 'errors' %}
+          <thead><tr><th>Run</th><th>Session / bill</th><th>Stage / source</th><th>Document kind</th><th>Class / HTTP</th><th>Retryable</th><th>Message</th><th>Attempts</th><th>Last seen</th><th>State</th></tr></thead>
+          <tbody>{% for row in rows %}<tr>
+            <td><a href="{{ url_for('run_detail', run_id=row.run_id) }}">#{{ row.run_id }}</a></td>
+            <td>{{ row.session_key or '—' }}{% if row.bill_id_compact %}<div><a href="{{ url_for('bills', session=row.session_key, q=row.bill_id_compact) }}">{{ row.bill_id_compact }}</a></div>{% endif %}</td>
+            <td>{{ (row.stage or '—')|replace('_', ' ') }}<div class="table-note">{{ row.source_entity_type or '—' }}{% if row.source_id %} #{{ row.source_id }}{% endif %}</div></td>
+            <td>{{ (row.document_kind or '—')|replace('_', ' ') }}</td>
+            <td>{{ row.error_class or '—' }}{% if row.http_status %}<div class="table-note">HTTP {{ row.http_status }}</div>{% endif %}</td>
+            <td><span class="status {{ 'failed_retryable' if row.retryable else 'failed_terminal' }}">{{ 'Yes' if row.retryable else 'No' }}</span></td>
+            <td class="error-text">{{ row.message }}</td>
+            <td>{{ row.attempt_count }}</td><td>{{ row.last_occurred_at }}</td><td>{{ 'Resolved' if row.resolved_at else 'Open' }}</td>
+          </tr>{% endfor %}</tbody>
+        {% else %}
+          <thead><tr><th>Run</th><th>Session / bill</th><th>Type</th><th>Severity</th><th>Completeness</th><th>Source identity</th><th>Document kind</th><th>Message</th><th>Occurrences</th><th>Last seen</th><th>State</th></tr></thead>
+          <tbody>{% for row in rows %}<tr>
+            <td>{% if row.last_run_id %}<a href="{{ url_for('run_detail', run_id=row.last_run_id) }}">#{{ row.last_run_id }}</a>{% else %}—{% endif %}</td>
+            <td>{{ row.session_key or '—' }}{% if row.bill_id_compact %}<div><a href="{{ url_for('bills', session=row.session_key, q=row.bill_id_compact) }}">{{ row.bill_id_compact }}</a></div>{% endif %}</td>
+            <td>{{ (row.anomaly_type or '—')|replace('_', ' ') }}</td><td><span class="status {{ 'failed' if row.severity in ['error','critical'] else 'completed_with_errors' }}">{{ row.severity }}</span></td>
+            <td>{{ 'Material gap' if row.affects_completeness else 'Diagnostic' }}</td>
+            <td>{{ row.source_entity_type or '—' }}{% if row.source_id %} #{{ row.source_id }}{% endif %}</td><td>{{ (row.document_kind or '—')|replace('_', ' ') }}</td>
+            <td>{{ row.message }}</td><td>{{ row.occurrence_count }}</td><td>{{ row.last_observed_at }}</td><td>{{ 'Resolved' if row.resolved_at else 'Open' }}</td>
+          </tr>{% endfor %}</tbody>
+        {% endif %}
+      </table></div>
+      <nav class="pagination" aria-label="Operations result pages">{% if pagination.prev_url %}<a class="button-link" href="{{ pagination.prev_url }}">Previous</a>{% endif %}<span>Page {{ pagination.page }}{% if pagination.pages %} of {{ pagination.pages }}{% endif %}</span>{% if pagination.next_url %}<a class="button-link" href="{{ pagination.next_url }}">Next</a>{% endif %}</nav>
+    {% else %}
+      <div class="empty-state"><strong>No {{ 'errors' if filters.view == 'errors' else 'anomalies' }} match these filters.</strong><p>Resolved records are retained for audit and can be included with the filter above.</p></div>
+    {% endif %}
+  </section>
+{% endblock %}

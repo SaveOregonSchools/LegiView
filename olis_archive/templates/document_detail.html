@@ -14,7 +14,8 @@
     <div class="action-row">
       {% if document.local_action_url %}<a class="button-link primary" href="{{ document.local_action_url }}">Open archived file</a>{% endif %}
       {% if document.reveal_action_url %}<a class="button-link" href="{{ document.reveal_action_url }}">Reveal file</a>{% endif %}
-      {% if document.source_url %}<a class="button-link" href="{{ document.source_url }}" target="_blank" rel="noopener">Open source</a>{% endif %}
+      {% set document_source_url = document.source_url|official_source_url %}
+      {% if document_source_url %}<a class="button-link" href="{{ document_source_url }}" target="_blank" rel="noopener">Open source</a>{% endif %}
     </div>
   </section>
 
@@ -23,6 +24,8 @@
     <div class="stat"><span class="stat-label">Attempts</span><strong>{{ document.attempt_count or 0 }}</strong></div>
     <div class="stat"><span class="stat-label">Downloaded bytes</span><strong>{{ document.downloaded_bytes or document.byte_count or '—' }}</strong></div>
     <div class="stat"><span class="stat-label">Validation</span><strong>{{ (document.validation_status or 'not checked')|replace('_', ' ') }}</strong></div>
+    <div class="stat"><span class="stat-label">Source presence</span><strong><span class="status {{ document.source_presence or 'unknown' }}">{{ document.source_presence or 'unknown' }}</span></strong></div>
+    <div class="stat"><span class="stat-label">Displayed in OLIS</span><strong>{% if document.displayed_in_olis is sameas true or document.displayed_in_olis == 1 %}Yes{% elif document.displayed_in_olis is sameas false or document.displayed_in_olis == 0 %}No{% else %}Unknown / N/A{% endif %}</strong></div>
   </section>
 
   {% if document.last_error %}<div class="message error"><strong>Last download error:</strong> {{ document.last_error }}{% if document.http_status %} (HTTP {{ document.http_status }}){% endif %}</div>{% endif %}
@@ -38,6 +41,7 @@
         <tr><th>Source entity</th><td>{{ document.source_entity_type or '—' }}</td></tr>
         <tr><th>Source numeric ID</th><td>{{ document.source_document_id or document.source_id or '—' }}</td></tr>
         <tr><th>Raw document type</th><td>{{ document.raw_document_type or '—' }}</td></tr>
+        <tr><th>Reconciliation origin</th><td>{{ (document.reconciliation_origin or '—')|replace('_', ' ') }}</td></tr>
         <tr><th>Exhibit reference</th><td>{{ document.exhibit_reference or '—' }}</td></tr>
         <tr><th>Created</th><td>{{ document.source_created_at or '—' }}</td></tr>
         <tr><th>Modified</th><td>{{ document.source_modified_at or '—' }}</td></tr>
@@ -57,6 +61,21 @@
       </tbody></table>
     </div>
   </section>
+
+  {% if probe %}
+    <section class="content-section detail-card">
+      <h3>Latest Remote-Size Probe</h3>
+      <table class="key-table"><tbody>
+        <tr><th>Status / time</th><td>{{ probe.probe_status|replace('_', ' ') }} · {{ probe.probed_at }}</td></tr>
+        <tr><th>HTTP status</th><td>{{ probe.http_status or '—' }}</td></tr>
+        <tr><th>Final URL</th><td>{% if probe.final_url %}<a href="{{ probe.final_url }}" target="_blank" rel="noopener">{{ probe.final_url }}</a>{% else %}—{% endif %}</td></tr>
+        <tr><th>Content type</th><td>{{ probe.content_type or '—' }}</td></tr>
+        <tr><th>Content length</th><td>{% if probe.content_length is not none %}{{ probe.content_length|human_bytes }}{% else %}Unknown{% endif %}</td></tr>
+        <tr><th>ETag / Last-Modified</th><td>{{ probe.etag or probe.last_modified or '—' }}</td></tr>
+        {% if probe.error_message %}<tr><th>Probe error</th><td class="error-text">{{ probe.error_class or 'Error' }}: {{ probe.error_message }}</td></tr>{% endif %}
+      </tbody></table>
+    </section>
+  {% endif %}
 
   <section class="content-section detail-card">
     <h3>Local Archive</h3>

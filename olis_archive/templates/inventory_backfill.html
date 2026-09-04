@@ -1,0 +1,76 @@
+{% extends "base.html" %}
+
+{% block title %}Inventory Backfill - LegiView{% endblock %}
+
+{% block content %}
+  <section class="page-heading">
+    <div>
+      <p class="eyebrow">Historical collection</p>
+      <h2>Inventory Backfill</h2>
+      <p class="heading-summary">Catalog official sessions, HB/SB metadata, and document identities without downloading payloads.</p>
+    </div>
+    <div class="action-row">
+      <form class="inline-form" method="post" action="{{ url_for('inventory_backfill') }}">
+        <input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
+        <button class="secondary" type="submit" name="action" value="resolve">Resolve official sessions</button>
+      </form>
+      <a class="button-link" href="{{ url_for('session_status') }}">Session status</a>
+    </div>
+  </section>
+
+  <div class="notice warning-note">
+    <strong>Acceptable use</strong>
+    <span>Prefer OData, keep pacing conservative, and follow the Oregon Legislature's current <a href="https://www.oregonlegislature.gov/citizen_engagement/Documents/OLODataAcceptableUseAgreement.pdf" target="_blank" rel="noopener">Open Data acceptable-use agreement</a>. Whole-database/full refreshes are limited by the published agreement to once per day after business hours (5:00 p.m.–6:00 a.m. Pacific).</span>
+  </div>
+  {% if source_error %}<div class="message error"><strong>Official session lookup failed.</strong> {{ source_error }} The stored session list remains available below.</div>{% endif %}
+
+  <section class="stat-grid compact" aria-label="Inventory configuration">
+    <div class="stat"><span class="stat-label">Sessions selected</span><strong>{{ selected_sessions|length }}</strong></div>
+    <div class="stat"><span class="stat-label">OData worker limit</span><strong>{{ pacing.odata_workers }}</strong></div>
+    <div class="stat"><span class="stat-label">OLIS HTML concurrency</span><strong>{{ pacing.html_concurrency }}</strong></div>
+    <div class="stat"><span class="stat-label">Inter-request delay</span><strong>{{ pacing.delay }} s</strong></div>
+    <div class="stat"><span class="stat-label">Disk free</span><strong>{{ paths.disk_free }}</strong></div>
+  </section>
+
+  <section class="two-column-sections content-section">
+    <div class="detail-card">
+      <h3>Effective paths</h3>
+      <table class="key-table"><tbody>
+        <tr><th>Project root</th><td><code>{{ paths.project_root }}</code></td></tr>
+        <tr><th>Archive root</th><td><code>{{ paths.archive_root }}</code></td></tr>
+      </tbody></table>
+    </div>
+    <div class="detail-card">
+      <h3>What this run does</h3>
+      <p>It resolves official sessions at or after <code>2014R1</code>, syncs HB/SB source entities page by page, reconciles required OLIS displays, normalizes durable document records, and records explicit completeness. It does <strong>not</strong> start Download Archive.</p>
+    </div>
+  </section>
+
+  <section class="content-section">
+    <div class="section-heading-row"><h2>Historical session scope</h2><span class="status-note">All resolved sessions are selected by default.</span></div>
+    <form method="post" action="{{ url_for('inventory_backfill') }}">
+      <input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
+      {% if sessions %}
+        <div class="table-scroll"><table>
+          <thead><tr><th class="check-column"><span class="visually-hidden">Select</span></th><th>Session</th><th>Dates</th><th>Inventory state</th><th>Last completed</th></tr></thead>
+          <tbody>{% for row in sessions %}<tr>
+            <td><input type="checkbox" name="session_keys" value="{{ row.session_key }}" aria-label="Select {{ row.session_key }}" {% if row.session_key in selected_sessions %}checked{% endif %}></td>
+            <td><strong>{{ row.session_key }}</strong><div class="table-note">{{ row.session_name or 'Official legislative session' }}</div></td>
+            <td>{{ row.begin_date or '—' }}<div class="table-note">through {{ row.end_date or 'open / unknown' }}</div></td>
+            <td><span class="status {{ row.inventory_status or 'not_started' }}">{{ (row.inventory_status or 'not_started')|replace('_', ' ') }}</span></td>
+            <td>{{ row.last_inventory_completed_at or '—' }}</td>
+          </tr>{% endfor %}</tbody>
+        </table></div>
+      {% else %}
+        <div class="empty-state"><strong>No historical session catalogue is stored yet.</strong><p>Use “Resolve official sessions” to preview the exact scope. You may also start now; LegiView will resolve and durably snapshot every official session at or after 2014R1 before work begins.</p></div>
+      {% endif %}
+      <div class="option-panel">
+        <div class="checkbox-field no-top-pad"><input id="probe_remote_sizes" name="probe_remote_sizes" type="checkbox" value="1"><label for="probe_remote_sizes">Probe remote sizes with bounded HEAD / Range requests</label></div>
+        <p class="field-note">Size probing is optional and adds source requests. Unknown sizes remain clearly identified; it never fetches a full payload solely for estimation.</p>
+        <div class="checkbox-field"><input id="force_full" name="force_full" type="checkbox" value="1"><label for="force_full">Force an authoritative full session comparison</label></div>
+        <p class="field-note">Use this deliberately to detect source disappearances after an earlier inventory. It ignores retained date watermarks for the selected sessions and is subject to the Legislature's full-refresh window and daily limit.</p>
+      </div>
+      <div class="form-actions retry-actions"><button type="submit" name="action" value="start">Start Inventory Backfill</button><span class="status-note">This explicit action freezes the selected session list in the durable run.</span></div>
+    </form>
+  </section>
+{% endblock %}

@@ -1,0 +1,70 @@
+{% extends "base.html" %}
+
+{% block title %}Download Archive - LegiView{% endblock %}
+
+{% block content %}
+  <section class="page-heading">
+    <div>
+      <p class="eyebrow">Safe payload acquisition</p>
+      <h2>Download Archive</h2>
+      <p class="heading-summary">Download eligible current payloads from the durable inventory. The selected sessions, filters, and creation-time cutoff are frozen in the run.</p>
+    </div>
+    <a class="button-link" href="{{ url_for('session_status') }}">Session status</a>
+  </section>
+
+  <div class="notice warning-note"><strong>Source-respectful operation</strong><span>Downloads use {{ worker_count }} bounded workers, safe redirects, retries, <code>.part</code> staging, validation, SHA-256, and the configured disk floor. Follow the Oregon Legislature's current <a href="https://www.oregonlegislature.gov/citizen_engagement/Documents/OLODataAcceptableUseAgreement.pdf" target="_blank" rel="noopener">acceptable-use requirements</a>.</span></div>
+
+  <section class="stat-grid compact" aria-label="Archive preflight">
+    <div class="stat"><span class="stat-label">Documents in scope</span><strong>{{ preflight.documents_in_scope }}</strong></div>
+    <div class="stat"><span class="stat-label">Recorded downloaded</span><strong>{{ preflight.recorded_downloaded }}</strong></div>
+    <div class="stat"><span class="stat-label">Pending / missing</span><strong>{{ preflight.pending_missing }}</strong></div>
+    <div class="stat"><span class="stat-label">Retryable failures</span><strong>{{ preflight.retryable_failures }}</strong></div>
+    <div class="stat"><span class="stat-label">Terminal / unavailable</span><strong>{{ preflight.terminal_or_non_downloadable }}</strong></div>
+    <div class="stat"><span class="stat-label">Eligible to claim</span><strong>{{ preflight.eligible_documents }}</strong></div>
+    <div class="stat"><span class="stat-label">Known pending bytes</span><strong>{{ preflight.known_pending_bytes|human_bytes }}</strong></div>
+    <div class="stat"><span class="stat-label">Unknown-size pending</span><strong>{{ preflight.unknown_size_pending }}</strong></div>
+  </section>
+
+  {% if preflight.unknown_size_pending %}<div class="notice warning-note"><strong>Lower-bound estimate</strong><span>The known pending byte total excludes {{ preflight.unknown_size_pending }} document{% if preflight.unknown_size_pending != 1 %}s{% endif %} whose size is unknown. Runtime free-space reservations still protect the configured floor.</span></div>{% endif %}
+  {% if preflight.recorded_downloaded %}<div class="notice info-note"><strong>Background verification</strong><span>“Recorded downloaded” reflects database state, not this preflight's filesystem verification. Starting the run revalidates those current payloads in the background and safely skips files that still match; a scope containing only recorded downloads is therefore still meaningful.</span></div>{% endif %}
+  {% if blocked %}<div class="message error"><strong>Launch blocked by free-space protection.</strong> {{ block_reason }}</div>{% endif %}
+
+  <section class="two-column-sections content-section">
+    <div class="detail-card"><h3>Storage</h3><table class="key-table"><tbody>
+      <tr><th>Archive root</th><td><code>{{ archive_root }}</code></td></tr>
+      <tr><th>Current disk free</th><td>{{ disk.free }}</td></tr>
+      <tr><th>Minimum floor</th><td>{{ disk.floor_gb }} GB ({{ disk.floor }})</td></tr>
+      <tr><th>Available above floor</th><td>{{ disk.usable }}</td></tr>
+    </tbody></table></div>
+    <div class="detail-card"><h3>Run boundary</h3><p>LegiView records a <code>scope_cutoff_at</code> timestamp when Start is pressed. Documents discovered after that boundary cannot silently enter this run. Valid current payloads are verified/skipped; prior immutable versions are retained.</p></div>
+  </section>
+
+  <section class="content-section">
+    <h2>Choose archive scope</h2>
+    <form method="post" action="{{ url_for('download_archive') }}">
+      <input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
+      <div class="two-column-sections">
+        <div class="detail-card">
+          <h3>Inventoried sessions</h3>
+          {% if sessions %}
+            <div class="choice-list">{% for row in sessions %}<label class="choice-row"><input type="checkbox" name="session_keys" value="{{ row.session_key }}" {% if row.session_key in selected_sessions %}checked{% endif %}><span><strong>{{ row.session_key }}</strong> — {{ row.session_name or 'Official session' }}<small>{{ (row.inventory_status or 'not_started')|replace('_', ' ') }}</small></span></label>{% endfor %}</div>
+          {% else %}
+            <div class="empty-state compact-empty"><strong>No inventoried sessions yet.</strong><p>Complete or partially process an <a href="{{ url_for('inventory_backfill') }}">Inventory Backfill</a> first.</p></div>
+          {% endif %}
+        </div>
+        <div class="detail-card">
+          <h3>Eligibility</h3>
+          <label class="choice-row"><input type="radio" name="eligibility" value="missing_pending" {% if eligibility != 'retryable' %}checked{% endif %}><span><strong>Missing / pending</strong><small>New, interrupted, missing-local, changed, and retryable current payloads.</small></span></label>
+          <label class="choice-row"><input type="radio" name="eligibility" value="retryable" {% if eligibility == 'retryable' %}checked{% endif %}><span><strong>Retryable failures only</strong><small>Explicitly retry recoverable failures; terminal validation failures stay excluded.</small></span></label>
+          <h3 class="subheading">Optional document kinds</h3>
+          <p class="field-note">Leave every kind unchecked to use the archive-target defaults (testimony, presentations, and floor letters). Metadata-only other/unknown records remain excluded unless explicitly selected and downloadable.</p>
+          <div class="choice-grid">{% for kind in document_kinds %}<label class="choice-row compact-choice"><input type="checkbox" name="document_kinds" value="{{ kind }}" {% if kind in selected_kinds %}checked{% endif %}><span>{{ kind|replace('_', ' ')|title }}</span></label>{% endfor %}</div>
+        </div>
+      </div>
+      <div class="form-actions retry-actions">
+        <button class="secondary" type="submit" name="action" value="preview">Preview selected scope</button>
+        <button type="submit" name="action" value="start" {% if blocked or not sessions or preflight.documents_in_scope < 1 or (eligibility == 'retryable' and preflight.eligible_documents < 1) %}disabled{% endif %}>Start Download Archive</button>
+      </div>
+    </form>
+  </section>
+{% endblock %}

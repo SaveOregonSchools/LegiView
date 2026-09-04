@@ -7,11 +7,21 @@
     <div>
       <p class="eyebrow">Configuration</p>
       <h2>Help and Data Sources</h2>
-      <p class="help-summary">LegiView is a local, provenance-first archive for Oregon House Bills and Senate Bills. Phase 1 collects one bill or one explicitly selected session and retains validated source files without destructive mirroring.</p>
+      <p class="help-summary">LegiView is a local, provenance-first archive for Oregon House Bills and Senate Bills. Phase 2 adds durable historical inventory, explicit completeness, and a separately started archive downloader without destructive mirroring.</p>
     </div>
   </section>
 
-  <nav class="subnav" aria-label="Help topics"><a href="#collecting">Collecting</a><a href="#runs">Runs and retry</a><a href="#archive">Archive safety</a><a href="#sources">Official sources</a><a href="#settings-help">Settings</a><a href="#limits">Phase 1 limits</a></nav>
+  <nav class="subnav" aria-label="Help topics"><a href="#historical">Historical archive</a><a href="#collecting">Targeted collection</a><a href="#runs">Runs and retry</a><a href="#archive">Archive safety</a><a href="#sources">Official sources</a><a href="#settings-help">Settings</a><a href="#limits">Phase 2 limits</a></nav>
+
+  <section class="help-section" id="historical">
+    <h3>Historical Inventory and Archive Download</h3>
+    <ol class="workflow-steps">
+      <li><div><strong>Resolve and select official sessions.</strong><p><a href="{{ url_for('inventory_backfill') }}">Inventory Backfill</a> uses official LegislativeSessions chronology and includes every session at or after 2014R1 by default.</p></div></li>
+      <li><div><strong>Build the inventory.</strong><p>The durable run catalogs HB/SB data, reconciles OData and required OLIS displays, records anomalies and explicit completeness, and never silently downloads payloads.</p></div></li>
+      <li><div><strong>Review completeness.</strong><p><a href="{{ url_for('session_status') }}">Session Status</a> shows document-kind totals, source anomalies, probe totals, failures, and last successful activity.</p></div></li>
+      <li><div><strong>Preview and start downloads separately.</strong><p><a href="{{ url_for('download_archive') }}">Download Archive</a> freezes selected sessions, kinds, statuses, and a creation-time cutoff. Known pending bytes are checked against the free-space floor.</p></div></li>
+    </ol>
+  </section>
 
   <section class="help-section" id="collecting">
     <h3>Collecting a Bill</h3>
@@ -49,9 +59,9 @@
       <a class="source-card" href="https://www.oregonlegislature.gov/citizen_engagement/Pages/data.aspx" target="_blank" rel="noopener"><strong>Oregon Legislative Data</strong><span>Official API entry point and data model</span></a>
       <a class="source-card" href="https://api.oregonlegislature.gov/odata/odataservice.svc/" target="_blank" rel="noopener"><strong>OData Service</strong><span>Measure, committee, member, and document metadata</span></a>
       <a class="source-card" href="https://olis.oregonlegislature.gov/" target="_blank" rel="noopener"><strong>OLIS</strong><span>Official bill pages and testimony displays</span></a>
-      <a class="source-card" href="https://www.oregonlegislature.gov/citizen_engagement/Documents/OLODataAcceptableUseAgreement.pdf" target="_blank" rel="noopener"><strong>Acceptable-Use Agreement</strong><span>Read and accept through the Legislature's normal process</span></a>
+      <a class="source-card" href="https://www.oregonlegislature.gov/citizen_engagement/Documents/OLODataAcceptableUseAgreement.pdf" target="_blank" rel="noopener"><strong>Acceptable-Use Agreement</strong><span>Read and agree before live collection</span></a>
     </div>
-    <div class="notice warning-note"><strong>Operator responsibility</strong><span>You must accept and follow any Oregon Legislature Open Data agreement through its normal process. LegiView does not automate acceptance, bypass access controls, evade rate limits, or conceal its User-Agent.</span></div>
+    <div class="notice warning-note"><strong>Operator responsibility</strong><span>The operator confirmed that they reviewed and agreed to the Oregon Legislature Open Data agreement; no separate submission form was observed during the 2026-09-03 validation. Continue to follow the published terms, and use any official acceptance mechanism if one appears. LegiView does not automate acceptance, bypass access controls, evade rate limits, or conceal its User-Agent.</span></div>
   </section>
 
   <section class="help-section" id="settings-help">
@@ -59,17 +69,17 @@
     <dl class="term-list">
       <div><dt>Archive root</dt><dd>Choose a durable location with enough capacity, normally outside this Git repository.</dd></div>
       <div><dt>Request timeout</dt><dd>Maximum time for a source request before it becomes a recorded failure.</dd></div>
-      <div><dt>OData workers</dt><dd>Keep low; filtered incremental requests are more important than parallelism.</dd></div>
+      <div><dt>Maximum OData workers</dt><dd>Keep this upper bound low; dependency-ordered ingestion may use fewer, and filtered incremental requests are more important than parallelism.</dd></div>
       <div><dt>Download workers</dt><dd>Controls bounded file acquisition. The default is intentionally conservative.</dd></div>
       <div><dt>HTML concurrency</dt><dd>Applies only to known OLIS pages needed for testimony reconciliation.</dd></div>
-      <div><dt>Free-space floor</dt><dd>Prevents a new download from consuming disk capacity reserved for the system.</dd></div>
+      <div><dt>Free-space floor</dt><dd>Configured in GB (5 GB by default) and converted to bytes for the downloader. It prevents a new transfer from consuming capacity reserved for the system.</dd></div>
       <div><dt>Inter-request delay</dt><dd>Adds pacing between source requests and complements server-directed <code>Retry-After</code>.</dd></div>
     </dl>
     <a class="button-link" href="{{ url_for('settings') }}">Open settings</a>
   </section>
 
   <section class="help-section compact-help-section" id="limits">
-    <h3>Phase 1 Boundaries</h3>
-    <p>Phase 1 does not perform multi-year backfill orchestration, scheduling, full-text indexing, OCR, semantic analysis, antivirus scanning, cloud hosting, or destructive source mirroring. It establishes the trustworthy collector, schema, downloader, durable run model, CLI, and local Flask interface that later phases can scale.</p>
+    <h3>Phase 2 Boundaries</h3>
+    <p>Phase 2 does not schedule recurring syncs, operate sist2, run OCR or semantic analysis, scan payloads for malware, add cloud/multi-user hosting, or destructively mirror source removals. Files remain ordinary readable payloads under one archive root for separately managed search tooling.</p>
   </section>
 {% endblock %}

@@ -9,12 +9,12 @@
       <h2>Collection Run History</h2>
       <p class="heading-summary">Persistent bill and session work remains visible across application restarts.</p>
     </div>
-    <div class="action-row"><a class="button-link primary" href="{{ url_for('collect_bill') }}">Collect a bill</a><a class="button-link" href="{{ url_for('retry_failures') }}">Retry failures</a></div>
+    <div class="action-row"><a class="button-link primary" href="{{ url_for('inventory_backfill') }}">Inventory Backfill</a><a class="button-link" href="{{ url_for('download_archive') }}">Download Archive</a><a class="button-link" href="{{ url_for('retry_failures') }}">Retry failures</a></div>
   </section>
 
   <section class="tool-surface accent-operations">
     <form method="get" action="{{ url_for('runs') }}" class="filter-form run-filter-form">
-      <div><label for="run_type">Run type</label><select id="run_type" name="run_type"><option value="">All types</option><option value="collect_bill" {% if filters.run_type == 'collect_bill' %}selected{% endif %}>Collect bill</option><option value="collect_session" {% if filters.run_type == 'collect_session' %}selected{% endif %}>Collect session</option></select></div>
+      <div><label for="run_type">Run type</label><select id="run_type" name="run_type"><option value="">All types</option>{% for value in ['inventory_backfill','download_archive','collect_bill','collect_session','retry_failures'] %}<option value="{{ value }}" {% if filters.run_type == value %}selected{% endif %}>{{ value|replace('_', ' ')|title }}</option>{% endfor %}</select></div>
       <div><label for="status">Status</label><select id="status" name="status"><option value="">All statuses</option>{% for value in ['queued', 'running', 'completed', 'completed_with_errors', 'failed', 'paused', 'canceled', 'interrupted'] %}<option value="{{ value }}" {% if filters.status == value %}selected{% endif %}>{{ value|replace('_', ' ')|title }}</option>{% endfor %}</select></div>
       <div><label for="scope">Session or bill</label><input id="scope" name="scope" value="{{ filters.scope or '' }}" placeholder="2026R1 or SB1501"></div>
       <div class="form-actions"><button type="submit">Apply filters</button><a class="button-link" href="{{ url_for('runs') }}">Clear</a></div>
@@ -42,7 +42,7 @@
       {% set prev_url = pagination.prev_url or pagination.previous_url %}
       <nav class="pagination" aria-label="Run result pages">{% if prev_url %}<a class="button-link" href="{{ prev_url }}">Previous</a>{% endif %}<span>Page {{ pagination.page or 1 }}{% if pagination.pages %} of {{ pagination.pages }}{% endif %}</span>{% if pagination.next_url %}<a class="button-link" href="{{ pagination.next_url }}">Next</a>{% endif %}</nav>
     {% else %}
-      <div class="empty-state"><strong>No collection runs found.</strong><p>Start with <a href="{{ url_for('collect_bill') }}">Collect a Bill</a>.</p></div>
+      <div class="empty-state"><strong>No collection runs found.</strong><p>Start an <a href="{{ url_for('inventory_backfill') }}">Inventory Backfill</a> or collect a targeted bill.</p></div>
     {% endif %}
   </section>
 {% endblock %}

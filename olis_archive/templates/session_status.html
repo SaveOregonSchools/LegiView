@@ -1,0 +1,53 @@
+{% extends "base.html" %}
+
+{% block title %}Session Status - LegiView{% endblock %}
+
+{% block content %}
+  <section class="page-heading">
+    <div>
+      <p class="eyebrow">Historical completeness</p>
+      <h2>Session Status</h2>
+      <p class="heading-summary">One durable inventory and archive summary per in-scope official session.</p>
+    </div>
+    <div class="action-row"><a class="button-link primary" href="{{ url_for('inventory_backfill') }}">Inventory Backfill</a><a class="button-link" href="{{ url_for('export_sessions') }}">Export CSV</a></div>
+  </section>
+
+  <section class="tool-surface accent-browse">
+    <form method="get" action="{{ url_for('session_status') }}" class="filter-form">
+      <div><label for="session">Session key</label><input id="session" name="session" value="{{ filters.session or '' }}" placeholder="2026R1"></div>
+      <div><label for="inventory_status">Inventory state</label><select id="inventory_status" name="inventory_status"><option value="">All states</option>{% for value in ['not_started','inventory_running','inventory_complete','inventory_complete_with_errors','inventory_incomplete','inventory_failed','interrupted'] %}<option value="{{ value }}" {% if filters.inventory_status == value %}selected{% endif %}>{{ value|replace('_', ' ')|title }}</option>{% endfor %}</select></div>
+      <div class="form-actions"><button type="submit">Apply filters</button><a class="button-link" href="{{ url_for('session_status') }}">Clear</a></div>
+    </form>
+  </section>
+
+  <section class="content-section">
+    <div class="section-heading-row"><h2>Sessions</h2><span class="status-note">{{ pagination.total or 0 }} result{% if (pagination.total or 0) != 1 %}s{% endif %}</span></div>
+    {% if rows %}
+      <div class="table-scroll"><table class="wide-table">
+        <thead><tr><th>Session</th><th>Dates</th><th>HB / SB</th><th>Inventory</th><th>Testimony</th><th>Presentation / legacy</th><th>Floor letters</th><th>Documents</th><th>Downloadable / downloaded</th><th>Failures</th><th>Unknown / anomalies</th><th>Remote size coverage</th><th>Known remote bytes</th><th>Local archive</th><th>Last inventory</th><th>Last download</th><th>Drill-down</th></tr></thead>
+        <tbody>{% for row in rows %}<tr>
+          <td><strong>{{ row.session_key }}</strong><div class="table-note">{{ row.session_name or '—' }}</div></td>
+          <td>{{ row.begin_date or '—' }}<div class="table-note">{{ row.end_date or 'Open / unknown' }}</div></td>
+          <td><a href="{{ url_for('bills', session=row.session_key, chamber='House') }}">{{ row.hb_count }}</a> / <a href="{{ url_for('bills', session=row.session_key, chamber='Senate') }}">{{ row.sb_count }}</a></td>
+          <td><span class="status {{ row.inventory_status }}">{{ row.inventory_status|replace('_', ' ') }}</span></td>
+          <td><a href="{{ url_for('documents', session=row.session_key, kind='public_testimony') }}">{{ row.public_testimony_count }}</a></td>
+          <td>{{ row.presentation_legacy_count }}<div class="table-note"><a href="{{ url_for('documents', session=row.session_key, kind='committee_presentation') }}">Presentations</a> · <a href="{{ url_for('documents', session=row.session_key, kind='legacy_testimony') }}">Legacy</a></div></td>
+          <td><a href="{{ url_for('documents', session=row.session_key, kind='floor_letter') }}">{{ row.floor_letter_count }}</a></td>
+          <td><a href="{{ url_for('documents', session=row.session_key) }}">{{ row.document_count }}</a></td>
+          <td>{{ row.downloadable_count }} / {{ row.downloaded_count }}</td>
+          <td><a href="{{ url_for('operations', view='errors', session=row.session_key) }}">{{ row.failure_count }}</a></td>
+          <td><a href="{{ url_for('operations', view='anomalies', session=row.session_key) }}">{{ row.unknown_anomaly_count }}</a></td>
+          <td>{{ row.known_size_count }} known / {{ row.unknown_size_count }} unknown</td>
+          <td>{{ row.known_remote_bytes|human_bytes }}{% if row.unknown_size_count %}<div class="table-note">Lower bound</div>{% endif %}</td>
+          <td>{{ row.local_archive_bytes|human_bytes }}</td>
+          <td>{{ row.last_successful_inventory_at or '—' }}{% if row.last_successful_inventory_run_id %}<div><a href="{{ url_for('run_detail', run_id=row.last_successful_inventory_run_id) }}">Run #{{ row.last_successful_inventory_run_id }}</a></div>{% endif %}</td>
+          <td>{{ row.last_download_activity_at or '—' }}{% if row.last_download_run_id %}<div><a href="{{ url_for('run_detail', run_id=row.last_download_run_id) }}">Run #{{ row.last_download_run_id }}</a></div>{% endif %}</td>
+          <td><a href="{{ url_for('bills', session=row.session_key) }}">Bills</a> · <a href="{{ url_for('documents', session=row.session_key) }}">Documents</a> · <a href="{{ url_for('runs', scope=row.session_key) }}">Runs</a></td>
+        </tr>{% endfor %}</tbody>
+      </table></div>
+      <nav class="pagination" aria-label="Session result pages">{% if pagination.prev_url %}<a class="button-link" href="{{ pagination.prev_url }}">Previous</a>{% endif %}<span>Page {{ pagination.page }}{% if pagination.pages %} of {{ pagination.pages }}{% endif %}</span>{% if pagination.next_url %}<a class="button-link" href="{{ pagination.next_url }}">Next</a>{% endif %}</nav>
+    {% else %}
+      <div class="empty-state"><strong>No in-scope sessions are stored yet.</strong><p>Use <a href="{{ url_for('inventory_backfill') }}">Inventory Backfill</a> to resolve and catalog the official scope.</p></div>
+    {% endif %}
+  </section>
+{% endblock %}

@@ -462,6 +462,10 @@ form {
   grid-template-columns: repeat(4, minmax(155px, 1fr));
 }
 
+.operations-filter-form {
+  grid-template-columns: repeat(4, minmax(155px, 1fr));
+}
+
 .run-filter-form {
   grid-template-columns: repeat(3, minmax(180px, 1fr)) auto;
 }
@@ -515,6 +519,71 @@ td input[type="checkbox"] {
 
 .checkbox-field label {
   margin: 0;
+}
+
+.no-top-pad {
+  padding-top: 0;
+}
+
+.option-panel {
+  margin-top: 14px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  padding: 13px;
+  background: var(--panel);
+}
+
+.choice-list,
+.choice-grid {
+  display: grid;
+  gap: 7px;
+  margin-top: 11px;
+}
+
+.choice-grid {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.choice-row {
+  display: flex;
+  gap: 9px;
+  align-items: flex-start;
+  margin: 0;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 9px;
+  background: #fff;
+  cursor: pointer;
+  font-weight: 500;
+}
+
+.choice-row input {
+  flex: 0 0 17px;
+  width: 17px;
+  min-height: 17px;
+  height: 17px;
+  margin-top: 2px;
+}
+
+.choice-row span,
+.choice-row small {
+  display: block;
+}
+
+.choice-row small {
+  margin-top: 3px;
+  color: var(--muted);
+  font-weight: 400;
+  line-height: 1.35;
+}
+
+.compact-choice {
+  align-items: center;
+  padding: 7px 9px;
+}
+
+.subheading {
+  margin-top: 18px;
 }
 
 .form-actions,
@@ -710,6 +779,8 @@ select:disabled {
 }
 
 .status.completed,
+.status.inventory_complete,
+.status.active,
 .status.downloaded,
 .status.good,
 .status.success,
@@ -729,6 +800,10 @@ select:disabled {
 }
 
 .status.completed_with_errors,
+.status.inventory_complete_with_errors,
+.status.inventory_incomplete,
+.status.inventory_running,
+.status.not_started,
 .status.paused,
 .status.paused_low_space,
 .status.interrupted,
@@ -741,6 +816,8 @@ select:disabled {
 }
 
 .status.failed,
+.status.inventory_failed,
+.status.missing,
 .status.failed_retryable,
 .status.failed_terminal,
 .status.error,
@@ -1095,6 +1172,15 @@ td {
   background: #fff;
 }
 
+.subnav a.active {
+  color: #fff;
+  background: var(--operations-accent);
+}
+
+.wide-table {
+  min-width: 1700px;
+}
+
 .help-section {
   margin-top: 18px;
   scroll-margin-top: 14px;
@@ -1215,6 +1301,7 @@ td {
 
   .nav-links {
     justify-content: flex-start;
+    flex-wrap: wrap;
   }
 
   .brand-logo {
@@ -1229,6 +1316,7 @@ td {
   .settings-form,
   .filter-form,
   .document-filter-form,
+  .operations-filter-form,
   .run-filter-form {
     grid-template-columns: 1fr;
   }
@@ -1261,6 +1349,10 @@ td {
 
   .checkbox-field {
     padding-top: 0;
+  }
+
+  .choice-grid {
+    grid-template-columns: 1fr;
   }
 }
 
