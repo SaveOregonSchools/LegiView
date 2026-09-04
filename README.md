@@ -91,8 +91,10 @@ For Ubuntu 24.04 deployment behind Nginx at `/legiview/`, install the optional
 backend remains on `127.0.0.1`, trusts exactly one explicitly enabled proxy hop, and
 uses `X-Forwarded-Prefix` to generate prefix-safe navigation, forms, redirects,
 static files, exports, API endpoints, and downloads. See
-[docs/linux_nginx.md](docs/linux_nginx.md); this repository does not install or
-modify Nginx configuration.
+[docs/linux_nginx.md](docs/linux_nginx.md) for the complete fresh-host procedure,
+including prerequisites, cloning, permissions, project-local `/opt/legiview/.env`,
+systemd registration, the Nginx location block, health checks, logs, and updates.
+This repository does not install or modify Nginx configuration.
 
 ## Configuration
 

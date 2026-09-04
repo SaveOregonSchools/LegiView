@@ -167,3 +167,55 @@ def test_supplied_gunicorn_config_is_single_process_and_loopback_only(
         runpy.run_path(
             str(Path(__file__).parents[1] / "deploy" / "gunicorn.conf.py")
         )
+
+
+def test_supplied_systemd_unit_uses_project_local_configuration():
+    root = Path(__file__).parents[1]
+    unit = (root / "deploy" / "legiview.service").read_text(encoding="utf-8")
+    environment = (root / "deploy" / "legiview.env.example").read_text(
+        encoding="utf-8"
+    )
+
+    assert "User=legiview" in unit
+    assert "Group=legiview" in unit
+    assert "WorkingDirectory=/opt/legiview" in unit
+    assert "EnvironmentFile=/opt/legiview/.env" in unit
+    assert "ExecStart=/opt/legiview/.venv/bin/gunicorn" in unit
+    assert "/etc/legiview" not in unit
+    assert "/opt/legiview/.env" in environment
+    assert "LEGIVIEW_HOST=127.0.0.1" in environment
+    assert "LEGIVIEW_URL_PREFIX=/legiview" in environment
+    assert "brad" not in unit.casefold()
+    assert "brad" not in environment.casefold()
+
+
+def test_fresh_install_guide_covers_prerequisites_proxy_and_operations():
+    guide = (
+        Path(__file__).parents[1] / "docs" / "linux_nginx.md"
+    ).read_text(encoding="utf-8")
+
+    required_steps = (
+        "apt install --yes",
+        "ca-certificates curl git iproute2 python3 python3-venv",
+        "useradd --system",
+        "git clone --branch main",
+        ".[server,test]",
+        "python -m pip check",
+        "chmod -R a+rX,go-w /opt/legiview",
+        "umask 0022 && git -C /opt/legiview pull --ff-only origin main",
+        "install -d -o legiview -g legiview -m 0750 data archive",
+        "deploy/legiview.env.example .env",
+        "systemctl link /opt/legiview/deploy/legiview.service",
+        "systemd-analyze verify",
+        "location ^~ /legiview/",
+        "proxy_pass http://127.0.0.1:5055/;",
+        "X-Forwarded-Prefix /legiview",
+        "nginx -t",
+        "http://brad/legiview/static/app.css",
+        "journalctl -u legiview.service",
+        "pull --ff-only origin main",
+    )
+    for step in required_steps:
+        assert step in guide
+
+    assert "/etc/legiview" not in guide

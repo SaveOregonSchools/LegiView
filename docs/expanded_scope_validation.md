@@ -177,7 +177,7 @@ that run by default. The current suite covers:
 - existing paging, retry, cancellation, reconciliation, download-validation,
   persistence, and archive-recovery regressions.
 
-Final full-suite result: `346 passed, 4 skipped` in 74.49 seconds on Windows.
+Final full-suite result: `348 passed, 4 skipped` in 83.72 seconds on Windows.
 The four skips are symlink-hardening cases for which this Windows account lacks
 the symlink privilege; the corresponding behavior remains covered where symlinks
 are available.

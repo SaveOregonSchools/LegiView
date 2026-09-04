@@ -161,5 +161,6 @@ Oregon Schools site. Keep a descriptive User-Agent when making requests.
 
 For a production Ubuntu service behind Nginx at a subpath, see
 [Ubuntu and Nginx subpath deployment](linux_nginx.md). The supplied server setup
-uses exactly one Gunicorn process because the application owns one exclusive
-database/archive mutation lock and one in-process durable-run dispatcher.
+loads its project-local `/opt/legiview/.env` through systemd and uses exactly one
+Gunicorn process because the application owns one exclusive database/archive
+mutation lock and one in-process durable-run dispatcher.
