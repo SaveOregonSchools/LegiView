@@ -254,6 +254,37 @@ def test_payload_versions_are_immutable_and_discovery_does_not_reset_download(tm
     }
 
 
+def test_completed_payload_can_use_path_and_byte_count_without_a_hash(tmp_path):
+    storage = make_storage(tmp_path)
+    bill_id = seed_bill(storage)
+    document_id = storage.upsert_document(
+        {
+            "bill_id": bill_id,
+            "document_kind": "floor_letter",
+            "source_section": "floor_letters",
+            "source_entity_type": "FloorLetter",
+            "source_id": "hashless-1",
+            "title": "Hashless payload",
+        },
+        seen_at=T1,
+    )
+
+    version_id = storage.complete_document_download(
+        document_id,
+        local_relative_path="2026R1/SB1501/floor_letter/hashless-1/letter.pdf",
+        local_filename="letter.pdf",
+        downloaded_bytes=123,
+        mime_type="application/pdf",
+        downloaded_at=T1,
+    )
+
+    document = storage.get_document(document_id)
+    version = storage.list_document_versions(document_id)[0]
+    assert document["current_version_id"] == version_id
+    assert document["sha256"] is None
+    assert version["sha256"] is None
+
+
 def test_restart_normalization_is_atomic_recoverable_and_idempotent(tmp_path):
     storage = make_storage(tmp_path)
     bill_id = seed_bill(storage)

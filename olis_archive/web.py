@@ -1396,7 +1396,6 @@ def _registered_local_file(runtime: Runtime, document: Mapping[str, Any]) -> Pat
         or document.get("validation_status") != "valid"
         or not filename
         or not mime_type
-        or not digest
         or downloaded_bytes is None
         or isinstance(downloaded_bytes, bool)
     ):

@@ -13,16 +13,16 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 import inspect
 import json
+import queue
 import shutil
 import threading
-from typing import Any, Callable, Iterable, Mapping, Protocol
+from typing import Any, Callable, Iterable, Mapping, Protocol, Sequence
 from urllib.parse import urlsplit
 
 from ..config import AppConfig, DEFAULT_ALLOWED_DOWNLOAD_HOSTS
 from ..database import Database
 from .archive_paths import resolve_stored_path
 from .documents import committee_document, floor_letter_document, public_testimony_documents
-from .file_types import validate_file
 from .historical_sources import (
     ENTITY_SYNC_SPECS,
     SessionEntityPlan,
@@ -199,6 +199,22 @@ class DownloadPreflight:
 
 
 ClaimedDownload = Callable[[int, Mapping[str, Any]], tuple[int, str, int]]
+PreparedClaim = Callable[[int, Mapping[str, Any]], "ClaimedPreparation"]
+FinalizePreparedBatch = Callable[[int, Sequence[Any]], list[tuple[int, str, int]]]
+
+
+@dataclass(frozen=True, slots=True)
+class ClaimedPreparation:
+    """A claimed transfer outcome, optionally awaiting database finalization."""
+
+    document_id: int
+    outcome: str = ""
+    byte_count: int = 0
+    payload: Any = None
+
+    @property
+    def ready(self) -> bool:
+        return self.payload is not None
 
 
 class HistoricalCollectionService:
@@ -215,6 +231,8 @@ class HistoricalCollectionService:
         olis_http: OLISLike,
         size_probe: RemoteSizeProbe,
         download_claimed: ClaimedDownload,
+        prepare_claimed: PreparedClaim | None = None,
+        finalize_prepared_batch: FinalizePreparedBatch | None = None,
     ) -> None:
         self.config = config
         self.database = database
@@ -224,6 +242,9 @@ class HistoricalCollectionService:
         self.olis_http = olis_http
         self.size_probe = size_probe
         self.download_claimed = download_claimed
+        self._default_download_claimed = download_claimed
+        self.prepare_claimed = prepare_claimed
+        self.finalize_prepared_batch = finalize_prepared_batch
         self._cached_session: str | None = None
         self._cached_legislator_names: dict[str, str] | None = None
         self._cached_committee_names: dict[str, str] | None = None
@@ -539,7 +560,7 @@ class HistoricalCollectionService:
         kinds = _document_kinds(scope.get("document_kinds"))
         # A failure-only run must not expand its frozen eligible-status scope
         # by auditing and adding durable skip items for healthy downloads.
-        # Normal archive runs audit those files so missing/corrupt local bytes
+        # Normal archive runs audit those files so missing/mismatched local bytes
         # can re-enter the database-backed claim queue safely.
         audit_counts = Counter()
         if not bool(scope.get("retryable_failures_only")):
@@ -554,7 +575,11 @@ class HistoricalCollectionService:
         counts: Counter[str] = Counter()
         counter_lock = threading.Lock()
 
-        def worker() -> None:
+        def record_outcome(outcome: str) -> None:
+            with counter_lock:
+                counts[outcome] += 1
+
+        def legacy_worker() -> None:
             while True:
                 if self.runs.status(run_id) != "running":
                     return
@@ -564,16 +589,100 @@ class HistoricalCollectionService:
                 document_id, outcome, byte_count = self.download_claimed(run_id, document)
                 del document_id
                 del byte_count
-                with counter_lock:
-                    counts[outcome] += 1
+                record_outcome(outcome)
 
-        with ThreadPoolExecutor(
-            max_workers=max(1, self.config.download_worker_count),
-            thread_name_prefix="legiview-archive",
-        ) as pool:
-            futures = [pool.submit(worker) for _ in range(max(1, self.config.download_worker_count))]
-            for future in futures:
-                future.result()
+        worker_count = max(1, self.config.download_worker_count)
+        use_pipeline = bool(
+            self.prepare_claimed
+            and self.finalize_prepared_batch
+            and self.download_claimed == self._default_download_claimed
+        )
+        if use_pipeline:
+            prepared_queue: queue.Queue[Any] = queue.Queue(maxsize=max(4, worker_count * 4))
+            sentinel = object()
+            finalizer_failure: list[BaseException] = []
+
+            def finalizer() -> None:
+                stop_after_batch = False
+                try:
+                    while not stop_after_batch:
+                        first = prepared_queue.get()
+                        if first is sentinel:
+                            return
+                        batch = [first]
+                        while len(batch) < 16:
+                            try:
+                                candidate = prepared_queue.get(timeout=0.01)
+                            except queue.Empty:
+                                break
+                            if candidate is sentinel:
+                                stop_after_batch = True
+                                break
+                            batch.append(candidate)
+                        assert self.finalize_prepared_batch is not None
+                        for _document_id, outcome, _byte_count in self.finalize_prepared_batch(
+                            run_id, batch
+                        ):
+                            record_outcome(outcome)
+                except BaseException as exc:
+                    finalizer_failure.append(exc)
+
+            finalizer_thread = threading.Thread(
+                target=finalizer,
+                name="legiview-archive-finalizer",
+            )
+            finalizer_thread.start()
+
+            def pipeline_worker() -> None:
+                assert self.prepare_claimed is not None
+                while not finalizer_failure:
+                    if self.runs.status(run_id) != "running":
+                        return
+                    document = self.storage.claim_next_archive_document(run_id)
+                    if document is None:
+                        return
+                    preparation = self.prepare_claimed(run_id, document)
+                    if not preparation.ready:
+                        record_outcome(preparation.outcome)
+                        continue
+                    while not finalizer_failure:
+                        try:
+                            prepared_queue.put(preparation.payload, timeout=0.25)
+                            break
+                        except queue.Full:
+                            continue
+
+            worker_failure: BaseException | None = None
+            try:
+                with ThreadPoolExecutor(
+                    max_workers=worker_count,
+                    thread_name_prefix="legiview-archive",
+                ) as pool:
+                    futures = [pool.submit(pipeline_worker) for _ in range(worker_count)]
+                    for future in futures:
+                        future.result()
+            except BaseException as exc:
+                worker_failure = exc
+            finally:
+                while finalizer_thread.is_alive():
+                    try:
+                        prepared_queue.put(sentinel, timeout=0.25)
+                        break
+                    except queue.Full:
+                        continue
+                finalizer_thread.join()
+            if worker_failure is not None:
+                raise worker_failure
+            if finalizer_failure:
+                raise finalizer_failure[0]
+        else:
+            with ThreadPoolExecutor(
+                max_workers=worker_count,
+                thread_name_prefix="legiview-archive",
+            ) as pool:
+                futures = [pool.submit(legacy_worker) for _ in range(worker_count)]
+                for future in futures:
+                    future.result()
 
         item_counts = self._download_item_counts(run_id)
         self.runs.set_counters(
@@ -1932,12 +2041,11 @@ class HistoricalCollectionService:
         """Boundedly verify current payloads recorded as downloaded.
 
         A durable ``downloaded`` flag is evidence of the last successful
-        promotion, not permission to assume a file can never be removed or
-        corrupted later.  This audit hashes/validates each selected current
-        payload and also compares its source timestamp with the retained
-        version.  It runs in the background only after an explicit Download
-        Archive start, never while rendering the preflight page.  Valid files
-        receive durable skipped items; recoverable files enter the normal
+        promotion, not permission to assume a file can never be removed later.
+        This audit checks each selected current path, filename, and recorded
+        byte count, then compares its source timestamp with the retained
+        version. It runs only after an explicit Download Archive start. Valid
+        files receive batched skip items; recoverable files enter the normal
         database-backed claim path.
         """
 
@@ -1998,6 +2106,7 @@ class HistoricalCollectionService:
             if not rows:
                 break
             transitions: list[tuple[int, str, str | None]] = []
+            prepared_rows: list[tuple[dict[str, Any], bool]] = []
             for row in rows:
                 self._check_control(run_id)
                 document = dict(row)
@@ -2010,14 +2119,33 @@ class HistoricalCollectionService:
                 source_changed = bool(
                     source_modified and source_modified != version_source_modified
                 )
-                locally_valid = False if source_changed else self._valid_current_payload(document)
+                prepared_rows.append((document, source_changed))
+
+            candidates = [document for document, changed in prepared_rows if not changed]
+            with ThreadPoolExecutor(
+                max_workers=max(1, min(self.config.download_worker_count, len(candidates) or 1)),
+                thread_name_prefix="legiview-archive-audit",
+            ) as pool:
+                validity = {
+                    int(document["id"]): valid
+                    for document, valid in zip(
+                        candidates,
+                        pool.map(self._valid_current_payload, candidates),
+                        strict=True,
+                    )
+                }
+
+            skipped: list[tuple[int, int, str]] = []
+            for document, source_changed in prepared_rows:
+                locally_valid = validity.get(int(document["id"]), False)
                 if not source_changed and locally_valid:
                     counters["valid_downloaded"] += 1
-                    self.runs.record_archive_document_skip(
-                        run_id,
-                        document_id=int(document["id"]),
-                        bill_id=int(document["bill_id"]),
-                        session_key=str(document["session_key"]),
+                    skipped.append(
+                        (
+                            int(document["id"]),
+                            int(document["bill_id"]),
+                            str(document["session_key"]),
+                        )
                     )
                     continue
                 has_url = bool(text(document.get("canonical_download_url")))
@@ -2071,6 +2199,7 @@ class HistoricalCollectionService:
                         run_item_id=item_id,
                         details={"payload_audit": "invalid_without_recovery_url"},
                     )
+            self.runs.record_archive_document_skips(run_id, skipped)
             if transitions:
                 with self.database.transaction() as connection:
                     connection.executemany(
@@ -2096,19 +2225,23 @@ class HistoricalCollectionService:
 
     def _valid_current_payload(self, document: Mapping[str, Any]) -> bool:
         relative = text(document.get("local_relative_path"))
-        if not relative:
+        filename = text(document.get("local_filename"))
+        expected_length = document.get("downloaded_bytes")
+        if (
+            document.get("validation_status") != "valid"
+            or not relative
+            or not filename
+            or expected_length is None
+        ):
             return False
         try:
             path = resolve_stored_path(self.config.archive_root, relative)
-            expected_length = document.get("downloaded_bytes")
-            result = validate_file(
-                path,
-                text(document.get("mime_type")) or "",
-                int(expected_length) if expected_length is not None else None,
-                expected_sha256=text(document.get("sha256")) or "",
-                logical_filename=text(document.get("local_filename")) or path.name,
+            return bool(
+                path.name == filename
+                and path.is_file()
+                and not path.is_symlink()
+                and path.stat().st_size == int(expected_length)
             )
-            return result.valid
         except (OSError, TypeError, ValueError):
             return False
 

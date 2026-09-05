@@ -138,9 +138,9 @@ cursor, and only a complete authoritative comparison can mark retained rows miss
 
 For payloads:
 
-- an unchanged valid current file is revalidated and skipped;
-- equal bytes reuse the existing SHA-256 version rather than storing a duplicate;
-- changed bytes create the next immutable `__v0002`-style version; and
+- an unchanged current file is checked by registered path, filename, and byte count;
+- a matching current file is skipped without reading it again to calculate a hash;
+- a later source revision creates the next immutable `__v0002`-style version; and
 - the logical document's current-version pointer changes only after validation and
   atomic promotion succeeds.
 

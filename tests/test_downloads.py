@@ -184,6 +184,55 @@ def test_streamed_download_hashes_validates_and_atomically_promotes(download_ser
     assert not list(tmp_path.rglob("*.part"))
 
 
+def test_fast_mode_reuses_http11_connection_and_skips_hash_and_fsync(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    client_ports: list[int] = []
+
+    class Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def do_GET(self):  # noqa: N802
+            client_ports.append(int(self.client_address[1]))
+            self.send_response(200)
+            self.send_header("Content-Type", "application/pdf")
+            self.send_header("Content-Length", str(len(PDF_BYTES)))
+            self.end_headers()
+            self.wfile.write(PDF_BYTES)
+
+        def log_message(self, _format, *_args):
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    monkeypatch.setattr(
+        "olis_archive.services.downloads.os.fsync",
+        lambda _fd: (_ for _ in ()).throw(AssertionError("fast mode must not fsync")),
+    )
+    try:
+        downloader = _downloader(calculate_sha256=False, durable_writes=False)
+        first = downloader.download_to_path(
+            f"http://127.0.0.1:{server.server_port}/first",
+            tmp_path / "first.pdf",
+            archive_root=tmp_path,
+        )
+        second = downloader.download_to_path(
+            f"http://127.0.0.1:{server.server_port}/second",
+            tmp_path / "second.pdf",
+            archive_root=tmp_path,
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    assert first.sha256 == second.sha256 == ""
+    assert first.byte_count == second.byte_count == len(PDF_BYTES)
+    assert len(client_ports) == 2
+    assert client_ports[0] == client_ports[1]
+
+
 def test_manual_redirect_is_recorded_and_revalidated(download_server, tmp_path: Path):
     base_url, counters = download_server
     result = _downloader().download_to_path(

@@ -12,7 +12,7 @@
     <a class="button-link" href="{{ url_for('session_status') }}">Session status</a>
   </section>
 
-  <div class="notice warning-note"><strong>Source-respectful operation</strong><span>Downloads use {{ worker_count }} bounded workers, safe redirects, retries, <code>.part</code> staging, validation, SHA-256, and the configured disk floor. Follow the Oregon Legislature's current <a href="https://www.oregonlegislature.gov/citizen_engagement/Documents/OLODataAcceptableUseAgreement.pdf" target="_blank" rel="noopener">acceptable-use requirements</a>.</span></div>
+  <div class="notice warning-note"><strong>Source-respectful operation</strong><span>Downloads use {{ worker_count }} bounded transfer workers, safe redirects, retries, <code>.part</code> staging, file validation, and the configured disk floor. Completed transfers are registered through a separate bounded finalization stage. Follow the Oregon Legislature's current <a href="https://www.oregonlegislature.gov/citizen_engagement/Documents/OLODataAcceptableUseAgreement.pdf" target="_blank" rel="noopener">acceptable-use requirements</a>.</span></div>
 
   <section class="stat-grid compact" aria-label="Archive preflight">
     <div class="stat"><span class="stat-label">Documents in scope</span><strong>{{ preflight.documents_in_scope }}</strong></div>

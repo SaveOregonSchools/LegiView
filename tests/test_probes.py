@@ -18,6 +18,11 @@ def probe_server():
 
         def do_HEAD(self):  # noqa: N802
             requests.append(("HEAD", self.path))
+            if self.path == "/redirect":
+                self.send_response(302)
+                self.send_header("Location", "/known")
+                self.end_headers()
+                return
             if self.path == "/known":
                 self.send_response(200)
                 self.send_header("Content-Type", "application/pdf")
@@ -88,6 +93,16 @@ def test_probe_prefers_head_when_content_length_is_known(probe_server):
     assert result.content_type == "application/pdf"
     assert result.etag == '"probe-etag"'
     assert requests == [("HEAD", "/known")]
+
+
+def test_probe_revalidates_manual_redirects(probe_server):
+    base_url, requests = probe_server
+
+    result = _probe().probe(f"{base_url}/redirect")
+
+    assert result.status == "known"
+    assert result.final_url == f"{base_url}/known"
+    assert requests == [("HEAD", "/redirect"), ("HEAD", "/known")]
 
 
 def test_probe_uses_one_byte_range_when_head_is_rejected(probe_server):

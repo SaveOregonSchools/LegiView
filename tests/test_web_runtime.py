@@ -104,6 +104,8 @@ def test_app_factory_uses_isolated_paths_and_does_not_start_workers(web_app, tmp
     assert runtime.config.archive_root == tmp_path / "archive"
     assert runtime.config.archive_root.is_dir()
     assert runtime.database.schema_version() == 6
+    assert runtime.collection.downloader.calculate_sha256 is False
+    assert runtime.collection.downloader.durable_writes is False
     assert extension["workers"].snapshot() == {
         "workers": 0,
         "queued": 0,
@@ -460,7 +462,6 @@ def test_detail_pages_and_registered_file_route_are_wired(web_app):
     local_file.write_bytes(PDF_BYTES)
     runtime.storage.complete_document_download(
         document_id,
-        sha256=sha256(PDF_BYTES).hexdigest(),
         local_relative_path=relative_path,
         downloaded_bytes=len(PDF_BYTES),
         mime_type="application/pdf",
