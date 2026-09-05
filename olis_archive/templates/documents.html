@@ -32,8 +32,9 @@
   <section class="content-section">
     <div class="section-heading-row"><h2>Documents</h2><span class="status-note">{{ pagination.total or rows|length or 0 }} result{% if (pagination.total or rows|length or 0) != 1 %}s{% endif %}</span></div>
     {% if rows %}
-      <div class="table-scroll"><table>
-        <thead><tr><th>Session / Measure</th><th>Kind</th><th>Title</th><th>Submitter</th><th>Committee / Date</th><th>Position</th><th>Presence / OLIS</th><th>Download</th><th>Bytes</th></tr></thead>
+      <div class="table-scroll"><table class="documents-table">
+        <colgroup><col class="document-measure"><col class="document-kind"><col class="document-title"><col class="document-submitter"><col class="document-committee"><col class="document-position"><col class="document-presence"><col class="document-download"><col class="document-size"></colgroup>
+        <thead><tr><th>Session /<br>Measure</th><th>Kind</th><th>Title</th><th>Submitter</th><th>Committee /<br>Date</th><th>Position</th><th>Presence /<br>OLIS</th><th>Download</th><th>File Size</th></tr></thead>
         <tbody>{% for row in rows %}<tr>
           <td>{{ row.session_key }}<div><a href="{{ url_for('bill_detail', bill_id=row.bill_pk or row.bill_id) }}">{{ row.bill_id_display or row.bill_id_compact }}</a></div></td>
           <td>{{ (row.document_kind or 'unknown')|replace('_', ' ')|title }}</td>

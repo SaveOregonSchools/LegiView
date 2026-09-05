@@ -202,6 +202,29 @@ class ArchiveQueries:
             (run_id,),
         )
 
+    def download_run_counts(self, run_id: int) -> dict[str, int]:
+        """Read live outcomes from the ledger, including runs from older workers.
+
+        Run headers only receive document totals when the download loop ends.
+        Grouping durable items also avoids double-counting attempts after resume.
+        """
+        rows = self._all(
+            """
+            SELECT status, COUNT(*) AS count FROM collection_run_items
+            WHERE run_id=? AND item_type='document'
+            GROUP BY status
+            """,
+            (run_id,),
+        )
+        counts = {row["status"]: int(row["count"]) for row in rows}
+        return {
+            "documents_recorded": sum(counts.values()),
+            "documents_downloaded": counts.get("completed", 0),
+            "documents_skipped": counts.get("skipped", 0),
+            "documents_failed": counts.get("failed_retryable", 0)
+            + counts.get("failed_terminal", 0),
+        }
+
     def run_items(
         self, run_id: int, *, limit: int = 50, offset: int = 0
     ) -> QueryPage:

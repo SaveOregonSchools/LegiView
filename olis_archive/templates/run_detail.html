@@ -1,7 +1,7 @@
 {% extends "base.html" %}
 
 {% block title %}Run #{{ run.id }} - LegiView{% endblock %}
-{% block head_extra %}{% if run.status in ['queued', 'running'] %}<meta http-equiv="refresh" content="15">{% endif %}{% endblock %}
+{% block head_extra %}<script src="{{ url_for('static', filename='run_detail.js') }}" defer></script>{% endblock %}
 
 {% block content %}
   <nav class="breadcrumbs" aria-label="Breadcrumb"><a href="{{ url_for('runs') }}">Run History</a><span>/</span><strong>#{{ run.id }}</strong></nav>
@@ -13,7 +13,7 @@
       <p class="heading-summary">{{ run.scope_display or run.requested_scope or 'No scope recorded' }}</p>
     </div>
     <div class="action-row">
-      <a class="button-link" href="{{ url_for('run_detail', run_id=run.id) }}">Refresh</a>
+      <a class="button-link" href="{{ url_for('run_detail', run_id=run.id, item_page=item_pagination.page, error_page=error_pagination.page) }}">Refresh</a>
       {% if run.status == 'running' %}<form class="inline-form" method="post" action="{{ url_for('pause_run', run_id=run.id) }}"><input type="hidden" name="_csrf_token" value="{{ csrf_token() }}"><button class="secondary" type="submit">Pause</button></form>{% endif %}
       {% if run.status in ['queued', 'running', 'paused', 'interrupted'] %}<form class="inline-form" method="post" action="{{ url_for('cancel_run', run_id=run.id) }}"><input type="hidden" name="_csrf_token" value="{{ csrf_token() }}"><button class="secondary" type="submit">Cancel</button></form>{% endif %}
       {% if run.status in ['paused', 'interrupted'] %}<form class="inline-form" method="post" action="{{ url_for('resume_run', run_id=run.id) }}"><input type="hidden" name="_csrf_token" value="{{ csrf_token() }}"><button type="submit">Resume</button></form>{% endif %}
@@ -22,17 +22,26 @@
     </div>
   </section>
 
-  {% if run.status in ['queued', 'running'] %}<div class="notice live-note"><span class="pulse-dot" aria-hidden="true"></span><span>This active-run page refreshes every 15 seconds. Progress is read from persisted stage records.</span></div>{% endif %}
+  <form class="run-refresh-form" id="run-refresh-form" method="post" action="{{ url_for('run_detail', run_id=run.id) }}" data-refresh-seconds="{{ refresh_seconds if run.status in ['queued', 'running'] else 0 }}">
+    <input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
+    <input type="hidden" name="item_page" value="{{ item_pagination.page }}">
+    <input type="hidden" name="error_page" value="{{ error_pagination.page }}">
+    <div><label for="refresh-seconds">Refresh rate (seconds)</label><input id="refresh-seconds" name="refresh_seconds" type="number" min="0" max="900" step="1" required value="{{ refresh_seconds }}" aria-describedby="refresh-help"></div>
+    <button type="submit">Save</button>
+    <span class="status-note" id="refresh-help">0 disables auto-refresh. Saved for run pages in this browser session.</span>
+  </form>
+  {% if run.status in ['queued', 'running'] %}<div class="notice live-note"><span class="pulse-dot" aria-hidden="true"></span><span id="refresh-status">{% if refresh_seconds %}This active-run page refreshes every {{ refresh_seconds }} second{{ '' if refresh_seconds == 1 else 's' }}.{% else %}Auto-refresh is off. Use Refresh to update progress.{% endif %}</span></div>{% endif %}
   {% if run.error_message %}<div class="message error">{{ run.error_message }}</div>{% endif %}
 
   <section class="stat-grid compact" aria-label="Run status">
     <div class="stat"><span class="stat-label">Status</span><strong><span class="status {{ run.status }}">{{ (run.status or 'unknown')|replace('_', ' ') }}</span></strong></div>
     <div class="stat"><span class="stat-label">Current stage</span><strong class="stat-date">{{ (run.stage or '—')|replace('_', ' ') }}</strong></div>
-    <div class="stat"><span class="stat-label">Measures/items</span><strong>{{ run.items_completed or run.bills_completed or 0 }} / {{ run.items_total or run.bills_planned or 0 }}</strong></div>
-    <div class="stat"><span class="stat-label">Documents discovered</span><strong>{{ run.documents_discovered or 0 }}</strong></div>
+    <div class="stat"><span class="stat-label">{{ 'Sessions' if run.run_type in ['inventory_backfill', 'download_archive'] else 'Measures/items' }}</span><strong>{{ run.items_completed or run.bills_completed or 0 }} / {{ run.items_total or run.bills_planned or 0 }}</strong></div>
+    <div class="stat"><span class="stat-label">{{ 'Documents selected' if run.run_type == 'download_archive' else 'Documents discovered' }}</span><strong>{{ run.documents_discovered or 0 }}</strong></div>
     <div class="stat"><span class="stat-label">Documents downloaded</span><strong>{{ run.documents_downloaded or 0 }}</strong></div>
     <div class="stat"><span class="stat-label">Skipped valid</span><strong>{{ run.documents_skipped or run.skipped_count or 0 }}</strong></div>
-    <div class="stat"><span class="stat-label">Failures</span><strong>{{ run.error_count or run.errors or 0 }}</strong></div>
+    {% if run.run_type == 'download_archive' %}<div class="stat"><span class="stat-label">Documents failed</span><strong>{{ run.documents_failed or 0 }}</strong></div>{% endif %}
+    <div class="stat"><span class="stat-label">Errors</span><strong>{{ run.error_count or run.errors or 0 }}</strong></div>
     <div class="stat"><span class="stat-label">Anomalies</span><strong>{{ run.anomaly_count or 0 }}</strong></div>
     <div class="stat"><span class="stat-label">Elapsed</span><strong class="stat-date">{{ elapsed or run.elapsed or '—' }}</strong></div>
     {% if run.run_type in ['inventory_backfill', 'download_archive'] %}
@@ -42,6 +51,8 @@
       <div class="stat"><span class="stat-label">Bytes downloaded</span><strong>{{ (run.bytes_downloaded or 0)|human_bytes }}</strong></div>
     {% endif %}
   </section>
+
+  {% if run.run_type == 'download_archive' %}<p class="status-note">Documents selected includes pending downloads and, for normal archive runs, recorded files to validate. Downloaded, skipped, and failed counts reflect the latest saved outcome per document. Session totals are finalized after the download workers finish.</p>{% endif %}
 
   <section class="two-column-sections content-section">
     <div class="detail-card">
@@ -98,7 +109,13 @@
         <thead><tr><th>Session / Measure / Document</th><th>Stage</th><th>Status</th><th>Progress</th><th>Attempts</th><th>Activity / counts</th><th>Updated</th></tr></thead>
         <tbody>{% for item in items %}<tr><td>{{ item.label or item.bill_id_display or item.document_title or item.source_document_id or '—' }}{% if item.inventory_status %}<div class="table-note">{{ item.inventory_status|replace('_', ' ') }}</div>{% endif %}</td><td>{{ (item.stage or '—')|replace('_', ' ') }}</td><td><span class="status {{ item.status }}">{{ (item.status or 'unknown')|replace('_', ' ') }}</span></td><td>{{ item.progress_current or 0 }}{% if item.progress_total is not none %} / {{ item.progress_total }}{% endif %}</td><td>{{ item.attempt_count or 0 }}</td><td>{{ item.message or item.error_message or '—' }}{% if item.detail_summary %}<div class="table-note">{{ item.detail_summary }}</div>{% endif %}</td><td>{{ item.updated_at or item.finished_at or '—' }}</td></tr>{% endfor %}</tbody>
       </table></div>
-      <nav class="pagination" aria-label="Run item pages">{% if item_pagination.prev_url %}<a class="button-link" href="{{ item_pagination.prev_url }}">Previous</a>{% endif %}<span>Page {{ item_pagination.page }}{% if item_pagination.pages %} of {{ item_pagination.pages }}{% endif %} · {{ item_pagination.total or 0 }} items</span>{% if item_pagination.next_url %}<a class="button-link" href="{{ item_pagination.next_url }}">Next</a>{% endif %}</nav>
+      <nav class="pagination" aria-label="Run item pages">
+        {% if item_pagination.first_url %}<a class="button-link" href="{{ item_pagination.first_url }}">First</a>{% else %}<button class="secondary" type="button" disabled>First</button>{% endif %}
+        {% if item_pagination.prev_url %}<a class="button-link" href="{{ item_pagination.prev_url }}">Previous</a>{% else %}<button class="secondary" type="button" disabled>Previous</button>{% endif %}
+        <span>Page {{ item_pagination.page }}{% if item_pagination.pages %} of {{ item_pagination.pages }}{% endif %} · {{ item_pagination.total or 0 }} items</span>
+        {% if item_pagination.next_url %}<a class="button-link" href="{{ item_pagination.next_url }}">Next</a>{% else %}<button class="secondary" type="button" disabled>Next</button>{% endif %}
+        {% if item_pagination.last_url %}<a class="button-link" href="{{ item_pagination.last_url }}">Last</a>{% else %}<button class="secondary" type="button" disabled>Last</button>{% endif %}
+      </nav>
     {% else %}<p class="empty">No per-item work has been recorded.</p>{% endif %}
   </section>
 

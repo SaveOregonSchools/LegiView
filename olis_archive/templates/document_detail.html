@@ -12,7 +12,7 @@
       <p class="heading-summary">Source record #{{ document.source_document_id or document.source_id or '—' }}</p>
     </div>
     <div class="action-row">
-      {% if document.local_action_url %}<a class="button-link primary" href="{{ document.local_action_url }}">Open archived file</a>{% endif %}
+      {% if document.local_action_url %}<a class="button-link primary" href="{{ document.local_action_url }}" target="_blank" rel="noopener">Open archived file</a>{% endif %}
       {% if document.reveal_action_url %}<a class="button-link" href="{{ document.reveal_action_url }}">Reveal file</a>{% endif %}
       {% set document_source_url = document.source_url|official_source_url %}
       {% if document_source_url %}<a class="button-link" href="{{ document_source_url }}" target="_blank" rel="noopener">Open source</a>{% endif %}
