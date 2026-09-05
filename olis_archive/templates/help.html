@@ -45,7 +45,7 @@
     <div class="folder-callout"><span>Example</span><code>&lt;archive_root&gt;/2026R1/SB1501/public_testimony/244133/document.pdf</code></div>
     <ul class="help-list">
       <li>Downloads stream into a <code>.part</code> staging file and are atomically finalized only after validation.</li>
-      <li>Every completed payload records byte count, MIME information, SHA-256, and a relative archive path.</li>
+      <li>Every completed payload records its filename, byte count, MIME information, and relative archive path. Older stored SHA-256 values remain supported.</li>
       <li>A changed payload is retained as another document version; earlier bytes are not silently overwritten.</li>
       <li>Filenames and paths are sanitized for Windows and registered before any local open/reveal action.</li>
       <li>LegiView does not execute downloaded content. Treat every PDF or Office file as untrusted.</li>
@@ -70,7 +70,7 @@
       <div><dt>Archive root</dt><dd>Choose a durable location with enough capacity, normally outside this Git repository.</dd></div>
       <div><dt>Request timeout</dt><dd>Maximum time for a source request before it becomes a recorded failure.</dd></div>
       <div><dt>Maximum OData workers</dt><dd>Keep this upper bound low; dependency-ordered ingestion may use fewer, and filtered incremental requests are more important than parallelism.</dd></div>
-      <div><dt>Download workers</dt><dd>Controls bounded file acquisition. The default is intentionally conservative.</dd></div>
+      <div><dt>Download workers</dt><dd>Controls concurrent network transfers from 1–8. The default is 2; database finalization runs separately.</dd></div>
       <div><dt>HTML concurrency</dt><dd>Applies only to known OLIS pages needed for testimony reconciliation.</dd></div>
       <div><dt>Free-space floor</dt><dd>Configured in GB (5 GB by default) and converted to bytes for the downloader. It prevents a new transfer from consuming capacity reserved for the system.</dd></div>
       <div><dt>Inter-request delay</dt><dd>Adds pacing between source requests and complements server-directed <code>Retry-After</code>.</dd></div>

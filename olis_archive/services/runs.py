@@ -411,10 +411,30 @@ class RunStore:
     ) -> int:
         """Persist a bounded Download Archive validation/skip result."""
 
+        return self.record_archive_document_skips(
+            run_id,
+            [(document_id, bill_id, session_key)],
+            message=message,
+        )[0]
+
+    def record_archive_document_skips(
+        self,
+        run_id: int,
+        documents: Iterable[tuple[int, int, str]],
+        *,
+        message: str = "Verified existing current payload",
+    ) -> list[int]:
+        """Persist many validation/skip results in one transaction."""
+
+        selected = [
+            (int(document_id), int(bill_id), str(session_key))
+            for document_id, bill_id, session_key in documents
+        ]
+        if not selected:
+            return []
         now = utc_now()
-        key = f"document:{int(document_id)}"
         with self.database.transaction() as connection:
-            connection.execute(
+            connection.executemany(
                 """
                 INSERT INTO collection_run_items(
                     run_id,item_type,item_key,session_key,bill_id,document_id,stage,
@@ -429,27 +449,32 @@ class RunStore:
                     finished_at=excluded.finished_at,interrupted_at=NULL,
                     updated_at=excluded.updated_at
                 """,
-                (
-                    run_id,
-                    key,
-                    session_key,
-                    int(bill_id),
-                    int(document_id),
-                    message[:2000],
-                    now,
-                    now,
-                    now,
-                    now,
-                ),
+                [
+                    (
+                        run_id,
+                        f"document:{document_id}",
+                        session_key,
+                        bill_id,
+                        document_id,
+                        message[:2000],
+                        now,
+                        now,
+                        now,
+                        now,
+                    )
+                    for document_id, bill_id, session_key in selected
+                ],
             )
-            row = connection.execute(
-                """
-                SELECT id FROM collection_run_items
-                WHERE run_id=? AND item_type='document' AND item_key=?
+            marks = ",".join("?" for _ in selected)
+            rows = connection.execute(
+                f"""
+                SELECT id,item_key FROM collection_run_items
+                WHERE run_id=? AND item_type='document' AND item_key IN ({marks})
                 """,
-                (run_id, key),
-            ).fetchone()
-            return int(row["id"])
+                (run_id, *(f"document:{document_id}" for document_id, _, _ in selected)),
+            ).fetchall()
+        by_key = {str(row["item_key"]): int(row["id"]) for row in rows}
+        return [by_key[f"document:{document_id}"] for document_id, _, _ in selected]
 
     def record_archive_document_failure(
         self,

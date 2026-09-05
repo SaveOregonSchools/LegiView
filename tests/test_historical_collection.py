@@ -16,7 +16,7 @@ from olis_archive.config import AppConfig
 from olis_archive.runtime import build_runtime
 from olis_archive.services.collection import CollectionService
 from olis_archive.services.downloads import Downloader
-from olis_archive.services.historical_collection import HistoricalRunControl
+from olis_archive.services.historical_collection import ClaimedPreparation, HistoricalRunControl
 from olis_archive.services.historical_sources import (
     REQUIRED_METADATA_PROPERTIES,
     HistoricalSourceError,
@@ -400,6 +400,8 @@ def _use_loopback_downloader(
         allow_private_network=True,
         minimum_free_space_bytes=minimum_free_space_bytes,
         chunk_size=11,
+        calculate_sha256=False,
+        durable_writes=False,
     )
 
 
@@ -1679,6 +1681,68 @@ def test_download_preflight_cutoff_and_database_claims_are_bounded(
     assert audit_stage["progress_total"] == 1
 
 
+def test_archive_transfer_workers_continue_while_results_are_finalized(
+    tmp_path: Path, fixture_dir: Path
+):
+    service, _odata, _olis, _downloader = _service(tmp_path, fixture_dir, workers=2)
+    pending, _downloaded, _terminal = _seed_download_scope(service)
+    run_id = service.create_download_archive_run(
+        ["2026R1"], document_kinds=["public_testimony"]
+    )
+    first_pair = threading.Barrier(2)
+    finalizer_started = threading.Event()
+    later_transfer_started = threading.Event()
+    lock = threading.Lock()
+    active = 0
+    maximum_active = 0
+    preparation_count = 0
+
+    def prepare(_run_id: int, document):
+        nonlocal active, maximum_active, preparation_count
+        with lock:
+            active += 1
+            maximum_active = max(maximum_active, active)
+            preparation_count += 1
+            ordinal = preparation_count
+        try:
+            if ordinal <= 2:
+                first_pair.wait(timeout=5)
+            else:
+                assert finalizer_started.wait(timeout=5)
+                later_transfer_started.set()
+            return ClaimedPreparation(int(document["id"]), payload=dict(document))
+        finally:
+            with lock:
+                active -= 1
+
+    def finalize_batch(finalized_run_id: int, documents):
+        finalizer_started.set()
+        assert later_transfer_started.wait(timeout=5)
+        outcomes = []
+        with service.database.transaction():
+            for document in documents:
+                document_id = int(document["id"])
+                service.storage.update_document_download_state(document_id, "downloaded")
+                assert service.runs.finalize_claimed_document_item(
+                    finalized_run_id,
+                    document_id,
+                    "completed",
+                    "fake pipelined transfer",
+                )
+                service.runs.add_downloaded_bytes(finalized_run_id, 10)
+                outcomes.append((document_id, "downloaded", 10))
+        return outcomes
+
+    service.historical.prepare_claimed = prepare
+    service.historical.finalize_prepared_batch = finalize_batch
+    assert service.execute_run(run_id) == "completed"
+
+    assert preparation_count == len(pending)
+    assert maximum_active == 2
+    assert finalizer_started.is_set()
+    assert later_transfer_started.is_set()
+
+
 def test_archive_keyset_cursor_claims_many_failures_once_and_advances_linearly(
     tmp_path: Path, fixture_dir: Path, monkeypatch: pytest.MonkeyPatch
 ):
@@ -2431,6 +2495,27 @@ def test_downloaded_payload_audit_excludes_documents_after_frozen_cutoff(
     assert audit_stage["progress_total"] == 0
 
 
+def test_downloaded_payload_audit_uses_registered_path_filename_and_size(
+    tmp_path: Path, fixture_dir: Path
+):
+    service, _odata, _olis, _downloader = _service(tmp_path, fixture_dir, workers=2)
+    document_id, path, _version_id = _seed_archive_document(
+        service,
+        "https://olis.oregonlegislature.gov/document/size-only",
+        source_id="size-only",
+        existing_payload=PDF_BYTES,
+    )
+    assert path is not None
+    service.storage.update_document_download_state(
+        document_id,
+        "downloaded",
+        sha256="0" * 64,
+    )
+
+    document = service.storage.get_document(document_id)
+    assert service.historical._valid_current_payload(document)
+
+
 @pytest.mark.parametrize("damage", ["missing", "corrupt"])
 def test_download_archive_recovers_missing_or_corrupt_current_payload(
     tmp_path: Path,
@@ -2461,16 +2546,19 @@ def test_download_archive_recovers_missing_or_corrupt_current_payload(
     recovered = service.storage.get_document(document_id)
     versions = service.storage.list_document_versions(document_id)
     assert recovered["download_status"] == "downloaded"
-    assert recovered["current_version_id"] == original_version_id
-    assert len(versions) == 1
-    assert versions[0]["id"] == original_version_id
-    assert versions[0]["local_relative_path"].endswith("Evidence__v0002.pdf")
-    assert (service.config.archive_root / versions[0]["local_relative_path"]).read_bytes() == PDF_BYTES
+    assert recovered["current_version_id"] != original_version_id
+    assert len(versions) == 2
+    current_version = next(
+        version for version in versions if version["id"] == recovered["current_version_id"]
+    )
+    assert current_version["sha256"] is None
+    assert current_version["local_relative_path"].endswith("Evidence__v0002.pdf")
+    assert (service.config.archive_root / current_version["local_relative_path"]).read_bytes() == PDF_BYTES
     assert counters["/recover"] == 1
     assert not list(service.config.archive_root.rglob("*.part"))
 
 
-def test_download_archive_same_hash_source_change_updates_metadata_without_duplicate_version(
+def test_download_archive_source_change_creates_hashless_immutable_version(
     tmp_path: Path,
     fixture_dir: Path,
     archive_server,
@@ -2509,14 +2597,16 @@ def test_download_archive_same_hash_source_change_updates_metadata_without_dupli
 
     current = service.storage.get_document(document_id)
     versions = service.storage.list_document_versions(document_id)
-    assert current["current_version_id"] == original_version_id
-    assert current["local_relative_path"] == original_path.relative_to(
-        service.config.archive_root
-    ).as_posix()
+    assert current["current_version_id"] != original_version_id
+    assert current["local_relative_path"].endswith("Evidence__v0002.pdf")
+    assert current["sha256"] is None
     assert original_path.read_bytes() == PDF_BYTES
-    assert len(versions) == 1
-    assert versions[0]["source_modified_at"] == T2
-    assert not (original_path.parent / "Evidence__v0002.pdf").exists()
+    assert len(versions) == 2
+    current_path = service.config.archive_root / current["local_relative_path"]
+    assert current_path.read_bytes() == PDF_BYTES
+    assert next(
+        version for version in versions if version["id"] == current["current_version_id"]
+    )["source_modified_at"] == T2
     assert counters["/same-hash"] == 1
 
 
@@ -2726,8 +2816,8 @@ def test_promoted_orphan_is_recovered_after_atomic_database_outcome_rolls_back(
     assert service.runs.requeue(run_id)
     assert service.execute_run(run_id) == "completed"
 
-    # Resume redownloads into `.part`, compares hashes, and adopts the orphan
-    # without replacing it or producing a duplicate version.
+    # Resume redownloads into `.part`, matches the orphan by path and byte count,
+    # and adopts it without replacing it or producing a duplicate version.
     assert counters["/crash-window"] == 2
     assert service.storage.get_document(document_id)["download_status"] == "downloaded"
     assert len(service.storage.list_document_versions(document_id)) == 1

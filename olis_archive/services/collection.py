@@ -30,7 +30,11 @@ from .downloads import (
     retry_delay_seconds,
 )
 from .file_types import validate_file
-from .historical_collection import HistoricalCollectionService, HistoricalRunControl
+from .historical_collection import (
+    ClaimedPreparation,
+    HistoricalCollectionService,
+    HistoricalRunControl,
+)
 from .historical_sources import SessionScope, require_supported_session_key
 from .odata import (
     ODataClient,
@@ -85,6 +89,12 @@ class _DownloadFinalizationError(RuntimeError):
     """A promoted payload could not be committed to its still-owned DB claim."""
 
     retryable = True
+
+
+@dataclass(frozen=True, slots=True)
+class _PreparedDownload:
+    document: dict[str, Any]
+    result: DownloadResult
 
 
 class SourceRecordNotFound(RuntimeError):
@@ -160,6 +170,8 @@ class CollectionService:
             minimum_free_space_bytes=config.minimum_free_space_bytes,
             require_https=True,
             allowed_ports={443},
+            calculate_sha256=False,
+            durable_writes=False,
         )
         self.sleep = sleep
         probe_http = getattr(self.downloader, "client", None) or SafeHTTPClient(
@@ -178,6 +190,8 @@ class CollectionService:
             olis_http=self.olis_http,
             size_probe=RemoteSizeProbe(probe_http, sleep=sleep),
             download_claimed=self._download_claimed_document,
+            prepare_claimed=self._prepare_claimed_document,
+            finalize_prepared_batch=self._finalize_prepared_download_batch,
         )
 
     # -- durable run creation ------------------------------------------------
@@ -1285,13 +1299,46 @@ class CollectionService:
 
         document_id = int(document["id"])
         try:
-            return self._download_one(
+            outcome = self._download_one(
                 run_id,
                 document,
                 self._next_version_number(document_id),
                 already_claimed=True,
             )
-        except CollectionCanceled:
+            assert isinstance(outcome, tuple)
+            return outcome
+        except Exception as exc:
+            return self._record_claimed_download_exception(run_id, document, exc)
+
+    def _prepare_claimed_document(
+        self, run_id: int, document: Mapping[str, Any]
+    ) -> ClaimedPreparation:
+        """Transfer one claimed payload without waiting for database finalization."""
+
+        document_id = int(document["id"])
+        try:
+            outcome = self._download_one(
+                run_id,
+                document,
+                self._next_version_number(document_id),
+                already_claimed=True,
+                defer_finalization=True,
+            )
+            if isinstance(outcome, ClaimedPreparation):
+                return outcome
+            return ClaimedPreparation(outcome[0], outcome[1], outcome[2])
+        except Exception as exc:
+            failed = self._record_claimed_download_exception(run_id, document, exc)
+            return ClaimedPreparation(failed[0], failed[1], failed[2])
+
+    def _record_claimed_download_exception(
+        self,
+        run_id: int,
+        document: Mapping[str, Any],
+        exc: BaseException,
+    ) -> tuple[int, str, int]:
+        document_id = int(document["id"])
+        if isinstance(exc, CollectionCanceled):
             self.storage.release_archive_document_claim(
                 run_id,
                 document_id,
@@ -1300,7 +1347,7 @@ class CollectionService:
                 message="Download canceled while preparing or retrying the transfer",
             )
             return document_id, "canceled", 0
-        except CollectionSuspended as exc:
+        if isinstance(exc, CollectionSuspended):
             item_status = "paused" if exc.status == "paused" else "interrupted"
             self.storage.release_archive_document_claim(
                 run_id,
@@ -1310,41 +1357,40 @@ class CollectionService:
                 message=f"Download {exc.status} while preparing or retrying the transfer",
             )
             return document_id, item_status, 0
-        except Exception as exc:
-            retryable = _is_retryable(exc)
-            status = "failed_retryable" if retryable else "failed_terminal"
-            self.storage.release_archive_document_claim(
-                run_id,
-                document_id,
-                document_status=status,
-                item_status=status,
-                message=str(exc),
-            )
-            self.runs.record_error(
-                run_id,
-                stage="download_archive",
-                error=exc,
-                retryable=retryable,
-                session_key=str(document.get("session_key") or "") or None,
-                bill_id_compact=str(document.get("bill_id_compact") or "") or None,
-                source_entity_type=str(document.get("source_entity_type") or "") or None,
-                source_id=str(document.get("source_id") or "") or None,
-                document_id=document_id,
-                source_url=document.get("canonical_download_url"),
-                details=(
-                    {
-                        "claim_finalization_failure": True,
-                        "cause_class": (
-                            type(exc.__cause__).__name__
-                            if exc.__cause__ is not None
-                            else None
-                        ),
-                    }
-                    if isinstance(exc, _DownloadFinalizationError)
-                    else {"claim_setup_failure": True}
-                ),
-            )
-            return document_id, "failed", 0
+        retryable = _is_retryable(exc)
+        status = "failed_retryable" if retryable else "failed_terminal"
+        self.storage.release_archive_document_claim(
+            run_id,
+            document_id,
+            document_status=status,
+            item_status=status,
+            message=str(exc),
+        )
+        self.runs.record_error(
+            run_id,
+            stage="download_archive",
+            error=exc,
+            retryable=retryable,
+            session_key=str(document.get("session_key") or "") or None,
+            bill_id_compact=str(document.get("bill_id_compact") or "") or None,
+            source_entity_type=str(document.get("source_entity_type") or "") or None,
+            source_id=str(document.get("source_id") or "") or None,
+            document_id=document_id,
+            source_url=document.get("canonical_download_url"),
+            details=(
+                {
+                    "claim_finalization_failure": True,
+                    "cause_class": (
+                        type(exc.__cause__).__name__
+                        if exc.__cause__ is not None
+                        else None
+                    ),
+                }
+                if isinstance(exc, _DownloadFinalizationError)
+                else {"claim_setup_failure": True}
+            ),
+        )
+        return document_id, "failed", 0
 
     def _download_one(
         self,
@@ -1353,7 +1399,8 @@ class CollectionService:
         version_number: int,
         *,
         already_claimed: bool = False,
-    ) -> tuple[int, str, int]:
+        defer_finalization: bool = False,
+    ) -> tuple[int, str, int] | ClaimedPreparation:
         document_id = int(document["id"])
         run_status = self.runs.status(run_id)
         if run_status == "paused":
@@ -1414,36 +1461,19 @@ class CollectionService:
                     archive_root=self.config.archive_root,
                     cancellation_requested=lambda: self.runs.should_abort_active_work(run_id),
                 )
-                outcome_status = "skipped" if result.skipped else "completed"
+                if defer_finalization:
+                    return ClaimedPreparation(
+                        document_id,
+                        payload=_PreparedDownload(dict(document), result),
+                    )
                 try:
                     with self.database.transaction():
-                        self._record_download_result(run_id, document, result)
-                        message = (
-                            "Validated existing bytes"
-                            if result.skipped
-                            else "Downloaded and validated"
+                        self._commit_download_result(
+                            run_id,
+                            document,
+                            result,
+                            already_claimed=already_claimed,
                         )
-                        if already_claimed:
-                            finalized = self.runs.finalize_claimed_document_item(
-                                run_id,
-                                document_id,
-                                outcome_status,
-                                message,
-                            )
-                            if not finalized:
-                                self._raise_claim_finalization_control(run_id, document_id)
-                        else:
-                            self.runs.mark_document_item(
-                                run_id,
-                                document_id,
-                                outcome_status,
-                                message,
-                            )
-                        if already_claimed and not result.skipped:
-                            # Claimed archive/retry workers have no later aggregate
-                            # transaction. Keep their durable byte counter in the
-                            # same commit as the document version and run-item result.
-                            self.runs.add_downloaded_bytes(run_id, result.byte_count)
                 except (CollectionCanceled, CollectionSuspended, _DownloadFinalizationError):
                     raise
                 except Exception as exc:
@@ -1540,6 +1570,93 @@ class CollectionService:
                 return document_id, "failed", 0
         return document_id, "failed", 0
 
+    def _commit_download_result(
+        self,
+        run_id: int,
+        document: Mapping[str, Any],
+        result: DownloadResult,
+        *,
+        already_claimed: bool,
+    ) -> tuple[int, str, int]:
+        """Commit one validated payload inside the caller's transaction."""
+
+        document_id = int(document["id"])
+        self._record_download_result(run_id, document, result)
+        outcome_status = "skipped" if result.skipped else "completed"
+        message = "Validated existing bytes" if result.skipped else "Downloaded and validated"
+        if already_claimed:
+            finalized = self.runs.finalize_claimed_document_item(
+                run_id,
+                document_id,
+                outcome_status,
+                message,
+            )
+            if not finalized:
+                self._raise_claim_finalization_control(run_id, document_id)
+        else:
+            self.runs.mark_document_item(
+                run_id,
+                document_id,
+                outcome_status,
+                message,
+            )
+        if already_claimed and not result.skipped:
+            self.runs.add_downloaded_bytes(run_id, result.byte_count)
+        return (
+            document_id,
+            "skipped" if result.skipped else "downloaded",
+            0 if result.skipped else result.byte_count,
+        )
+
+    def _finalize_prepared_download_batch(
+        self,
+        run_id: int,
+        prepared: Iterable[Any],
+    ) -> list[tuple[int, str, int]]:
+        """Finalize a small transfer batch in one commit, isolating any failure."""
+
+        batch = list(prepared)
+        if any(not isinstance(item, _PreparedDownload) for item in batch):
+            raise TypeError("Prepared archive batch contained an unexpected payload")
+        if not batch:
+            return []
+        try:
+            with self.database.transaction():
+                return [
+                    self._commit_download_result(
+                        run_id,
+                        item.document,
+                        item.result,
+                        already_claimed=True,
+                    )
+                    for item in batch
+                ]
+        except Exception:
+            outcomes: list[tuple[int, str, int]] = []
+            for item in batch:
+                try:
+                    with self.database.transaction():
+                        outcome = self._commit_download_result(
+                            run_id,
+                            item.document,
+                            item.result,
+                            already_claimed=True,
+                        )
+                except Exception as exc:
+                    outcome = self._record_claimed_download_exception(
+                        run_id,
+                        item.document,
+                        (
+                            exc
+                            if isinstance(exc, (CollectionCanceled, CollectionSuspended, _DownloadFinalizationError))
+                            else _DownloadFinalizationError(
+                                "Downloaded payload could not be durably finalized"
+                            )
+                        ),
+                    )
+                outcomes.append(outcome)
+            return outcomes
+
     def _raise_claim_finalization_control(
         self, run_id: int, document_id: int
     ) -> None:
@@ -1615,7 +1732,11 @@ class CollectionService:
     ) -> None:
         document_id = int(document["id"])
         self.runs.resolve_document_errors(run_id, document_id)
-        existing = self._version_with_hash(document_id, result.sha256)
+        existing = (
+            self._version_with_hash(document_id, result.sha256)
+            if result.sha256
+            else None
+        )
         if existing and existing.get("local_relative_path") != result.relative_path:
             existing_path = resolve_stored_path(self.config.archive_root, existing["local_relative_path"])
             valid = validate_file(
@@ -1698,18 +1819,24 @@ class CollectionService:
         )
 
     def _valid_completed_document(self, document: Mapping[str, Any]) -> bool:
-        if document.get("download_status") != "downloaded" or not document.get("local_relative_path"):
+        if (
+            document.get("download_status") != "downloaded"
+            or document.get("validation_status") != "valid"
+            or not document.get("local_relative_path")
+        ):
             return False
         try:
             path = resolve_stored_path(self.config.archive_root, document["local_relative_path"])
-            result = validate_file(
-                path,
-                document.get("mime_type") or "",
-                _int_or_none(document.get("downloaded_bytes")),
-                expected_sha256=document.get("sha256") or "",
-                logical_filename=document.get("local_filename") or path.name,
+            filename = _text(document.get("local_filename"))
+            expected_length = _int_or_none(document.get("downloaded_bytes"))
+            return bool(
+                filename
+                and expected_length is not None
+                and path.name == filename
+                and path.is_file()
+                and not path.is_symlink()
+                and path.stat().st_size == expected_length
             )
-            return result.valid
         except (OSError, ValueError):
             return False
 

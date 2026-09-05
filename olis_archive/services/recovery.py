@@ -18,7 +18,6 @@ from .archive_paths import (
 )
 from .downloads import DestinationConflict, atomic_promote_no_replace
 from .file_types import FileValidation, validate_file
-from .hashing import sha256_file
 
 
 @dataclass(frozen=True, slots=True)
@@ -90,13 +89,17 @@ def validate_completed_download(
             "",
             validation,
         )
-    digest = expected_sha256.casefold() or sha256_file(final)
+    digest = expected_sha256.casefold()
     return RecoveryResult(
         "adopted_final",
         relative,
         final,
         part,
-        "Existing completed file passed byte, type, and SHA-256 expectations.",
+        (
+            "Existing completed file passed byte, type, and SHA-256 expectations."
+            if digest
+            else "Existing completed file passed byte and type expectations."
+        ),
         final.stat().st_size,
         digest,
         validation,
@@ -196,7 +199,7 @@ def recover_incomplete_download(
             validation,
         )
 
-    digest = expected_sha256.casefold() or sha256_file(part)
+    digest = expected_sha256.casefold()
     byte_count = part.stat().st_size
     try:
         atomic_promote_no_replace(part, final)

@@ -1027,7 +1027,7 @@ class StorageService:
         self,
         document_id: int,
         *,
-        sha256: str,
+        sha256: str | None = None,
         local_relative_path: str,
         downloaded_bytes: int,
         mime_type: str | None = None,
@@ -1045,7 +1045,7 @@ class StorageService:
     ) -> int:
         """Record a validated payload and select it as the logical document's current version."""
 
-        digest = _normalized_sha256(sha256)
+        digest = _normalized_sha256(sha256) if sha256 else None
         timestamp = _utc_timestamp(downloaded_at)
         if downloaded_bytes < 0:
             raise ValueError("downloaded_bytes must not be negative")

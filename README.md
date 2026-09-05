@@ -233,10 +233,10 @@ In the UI:
    failure, non-downloadable, known-byte,
    unknown-size, disk-free, floor, archive-root, and worker-count preflight values.
    The preflight is SQL-only: it reports recorded state without opening or hashing
-   every archived file. A normal Download Archive run validates recorded current
-   files in bounded background work and skips them only when their bytes remain
-   valid. Retryable-failures-only mode deliberately does not audit healthy recorded
-   downloads.
+   every archived file. A normal Download Archive run checks recorded current files
+   in bounded background work and skips them when their registered path, filename,
+   and byte count still match. Retryable-failures-only mode deliberately does not
+   audit healthy recorded downloads.
 4. Press **Start Download Archive** explicitly.
 5. Use Run Detail to pause, cancel, or resume. Completed files are always retained.
 
@@ -245,8 +245,11 @@ automatic refresh. The preference applies to run pages in the current browser
 session, and refresh pauses while editing it. Run Items provides First/Previous
 and Next/Last navigation.
 
-Download Archive progress reads the latest saved document outcomes while workers
-are running, including on the dashboard and Run History. **Documents selected**
+Download Archive keeps the configured 1–8 payload workers (default 2) busy with
+network transfers while a bounded finalization queue batches file registration and
+run updates. Workers reuse HTTP connections to the same source. Progress reads the
+latest saved document outcomes while the run is active, including on the dashboard
+and Run History. **Documents selected**
 uses the saved preflight count of pending downloads plus recorded files to validate
 (pending failures only for retry runs). Downloaded, skipped, and failed counts each
 count documents once, even after retry/resume. Session totals are finalized when
@@ -317,8 +320,10 @@ immutable versions, runs/items/stages, counters, and errors. Payloads use:
 
 Only relative archive paths are stored. Downloads use official-host and redirect
 validation, free-space reservations, streaming `.part` files, length/type/signature
-validation, SHA-256, flush, and atomic no-replace promotion. Equal content reuses its
-retained version; changed bytes create `__v0002` and later immutable suffixes. No
+validation and atomic no-replace promotion. New downloads use the registered path,
+filename, and byte count as their lightweight identity and do not calculate SHA-256
+or force a disk sync for every small file. A later source revision creates `__v0002`
+and subsequent immutable suffixes. Existing stored hashes remain supported. No
 successful source comparison, cancel, retry, or low-space event deletes records or
 previous payloads.
 
@@ -328,7 +333,8 @@ legacy LegiView trees are adopted once, and arbitrary nonempty directories are
 rejected without cleanup.
 
 Before serving a registered local file, the UI rechecks its path, filename, type,
-size, and hash. Mutating forms require a session-bound CSRF token.
+size, and any previously stored hash. Mutating forms require a session-bound CSRF
+token.
 
 **Downloaded files are untrusted.** LegiView never executes them and does not provide
 antivirus scanning, Office automation, OCR, or content extraction. See

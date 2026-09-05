@@ -97,7 +97,7 @@ whole hierarchy to the same relative layout before changing the setting.
 state, and pointer to the current validated payload. `document_versions` records
 retained byte versions with observation time, producing collection run, final source
 URL, source modified date, ETag/Last-Modified when available, filename, relative path,
-byte count, MIME type, SHA-256, validation state, and status.
+byte count, MIME type, optional SHA-256 for older records, validation state, and status.
 
 The first retained filename is unnumbered. A later candidate version uses a stable
 suffix before its extension:
@@ -108,17 +108,18 @@ Testimony__v0002.pdf
 Testimony__v0003.pdf
 ```
 
-A source metadata change can trigger a new fetch. LegiView validates and hashes the
-new candidate before changing the logical document's current-version pointer. If the
-SHA-256 matches an already retained payload, the existing immutable version is reused.
-If it differs, both versions remain. Previously retained bytes are never silently
-overwritten or deleted.
+A source metadata change can trigger a new fetch. LegiView validates the new candidate
+before changing the logical document's current-version pointer. New downloads use
+their registered path, filename, and byte count instead of calculating SHA-256, so a
+later source revision receives the next immutable version path. Previously retained
+bytes are never silently overwritten or deleted. Hashes stored by older releases are
+retained and remain usable during explicit validation and recovery.
 
 An idempotent rerun preserves first-seen timestamps and stable keys, updates current
 source metadata and last-seen timestamps, and validates the recorded local file. A
-completed record is skipped only if the file exists under the registered path and
-passes its stored byte, type, and SHA-256 expectations. A missing or invalid local
-file becomes recoverable work instead of being treated as complete.
+completed record is skipped only if the file exists under the registered path with
+the registered filename and byte count. A missing or mismatched local file becomes
+recoverable work instead of being treated as complete.
 
 ## Streaming and atomic promotion
 
@@ -127,10 +128,14 @@ Redirect targets are checked again. A transfer:
 
 1. reserves/checks disk space against the configured floor;
 2. creates `<final-name>.part` without replacing an existing path;
-3. streams bounded chunks while counting bytes and calculating SHA-256;
+3. streams bounded chunks while counting bytes;
 4. checks advertised/expected length, declared MIME type, and strong file signatures;
-5. flushes the staged file to disk; and
+5. closes the staged file through normal operating-system buffered I/O; and
 6. atomically promotes it to the final name without replacing unrelated bytes.
+
+Payload workers reuse persistent HTTP connections to the same source. LegiView does
+not force a file and directory sync after every small payload; backups and ordinary
+filesystem writeback provide the selected durability tradeoff for this local archive.
 
 Retryable HTTP and network failures use bounded backoff and honor `Retry-After`.
 Validation failures, redirects outside the allowlist, and destination conflicts are
@@ -139,10 +144,13 @@ recorded rather than forced through. Low free space sets the document to
 GB, where one LegiView GB is `1024 ** 3` bytes; reservations and checks continue in
 bytes internally.
 
-At historical scale, eligible rows are claimed atomically from SQLite in bounded
-batches rather than loaded into one Python queue. A claim creates or updates the
-durable document run item. Pause/cancel stops new claims, concurrent workers cannot
-win the same row, and the existing validation/version rules still govern promotion.
+At historical scale, eligible rows are claimed atomically from SQLite rather than
+loaded into one all-history Python queue. The configured 1–8 worker value, default 2,
+controls concurrent network transfers. Promoted results enter a separate bounded
+queue; one finalizer records small batches in SQLite while transfer workers claim the
+next files. A claim creates or updates the durable document run item. Pause/cancel
+stops new claims, concurrent workers cannot win the same row, and the existing
+validation/version rules still govern promotion.
 
 ## Restart and `.part` recovery
 
@@ -183,8 +191,8 @@ deliberately reattempt a terminal failure:
 The historical bulk command includes only retryable failures; it excludes terminal
 validation failures. A normal Download Archive run audits recorded current files in
 bounded background work, while retryable-failures-only mode intentionally avoids
-auditing healthy downloads. Equal valid bytes still reuse the known version, so an
-explicit retry does not duplicate logical rows or payload versions.
+auditing healthy downloads. An explicit retry of a registered current file is skipped
+when its path, filename, and byte count still match.
 
 See [recovery.md](recovery.md) for historical-run pause, claim, cancel, restart, and
 operator-recovery semantics.
@@ -196,7 +204,7 @@ does not contain payload bytes, and the archive alone does not contain all sourc
 run provenance. LegiView does not delete remote-source records merely because a later
 query omits them, and it is not a destructive mirror.
 
-Archived files remain untrusted even after type and hash validation. LegiView does
+Archived files remain untrusted even after type/signature validation. LegiView does
 not execute them and provides no antivirus scanning, OCR, or content extraction.
 Ordinary files remain directly readable by external tools such as sist2, but LegiView
 does not manage a sist2 process or index in Phase 2.

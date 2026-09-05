@@ -7,7 +7,6 @@ import re
 import time
 from typing import Callable, Mapping
 import urllib.error
-import urllib.request
 from urllib.parse import urljoin, urlsplit
 
 from .downloads import (
@@ -176,14 +175,12 @@ class RemoteSizeProbe:
         original_scheme = urlsplit(url).scheme.casefold()
         for redirect_count in range(self.http.max_redirects + 1):
             self.http.validate_target(current)
-            request = urllib.request.Request(
-                current,
-                method=method,
-                headers={"User-Agent": self.http.user_agent, "Accept": "*/*"},
-            )
             response = None
             try:
-                response = self.http.opener.open(request, timeout=self.http.timeout_seconds)
+                response = self.http.open_response(
+                    current,
+                    method=method,
+                )
             except urllib.error.HTTPError as exc:
                 status = int(exc.code)
                 if status in REDIRECT_STATUSES:
@@ -231,11 +228,38 @@ class RemoteSizeProbe:
                 self.http._validate_headers(response.headers)
                 raw_status = getattr(response, "status", None)
                 status = int(raw_status if raw_status is not None else response.getcode())
+                if status in REDIRECT_STATUSES:
+                    location = response.headers.get("Location", "")
+                    if not location:
+                        raise DownloadError(
+                            "Redirect response did not provide a Location header.",
+                            status_code=status,
+                            code="invalid_redirect",
+                        )
+                    destination = urljoin(current, location)
+                    if (
+                        original_scheme == "https"
+                        and urlsplit(destination).scheme.casefold() == "http"
+                        and not self.http.allow_https_downgrade
+                    ):
+                        from .downloads import UnsafeDownloadTarget
+
+                        raise UnsafeDownloadTarget("HTTPS-to-HTTP redirects are blocked.")
+                    current = destination
+                    if redirect_count >= self.http.max_redirects:
+                        raise DownloadError(
+                            "Maximum redirect count exceeded.", code="too_many_redirects"
+                        )
+                    continue
                 if not 200 <= status <= 299:
+                    retryable = status in RETRYABLE_HTTP_STATUSES or 500 <= status <= 599
                     raise NetworkDownloadError(
-                        f"Remote server returned unexpected HTTP {status}.",
-                        retryable=500 <= status <= 599,
+                        f"Remote server returned HTTP {status}.",
+                        retryable=retryable,
                         status_code=status,
+                        retry_after_seconds=retry_after_seconds(
+                            response.headers.get("Retry-After")
+                        ),
                         code="http_error",
                     )
                 return current, status, safe_response_headers(response.headers)

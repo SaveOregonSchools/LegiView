@@ -130,7 +130,7 @@ delete the old generic key.
 | `LEGIVIEW_ARCHIVE_ROOT` | `archive` | Payload archive, relative to the effective project root unless absolute. |
 | `LEGIVIEW_REQUEST_TIMEOUT` | `30` | OData, OLIS HTML, probe, and download timeout in seconds. |
 | `LEGIVIEW_ODATA_WORKERS` | `1` | Maximum OData workers available to the one active durable run; dependency-ordered ingestion may use fewer. Allowed range 1–4. |
-| `LEGIVIEW_DOWNLOAD_WORKERS` | `2` | Concurrent payload workers within a download run; allowed range 1–8. |
+| `LEGIVIEW_DOWNLOAD_WORKERS` | `2` | Concurrent payload network transfers within a download run; allowed range 1–8. Completed transfers use a separate bounded finalization stage. |
 | `LEGIVIEW_HTML_CONCURRENCY` | `1` | Concurrent narrowly scoped OLIS HTML requests; allowed range 1–2. |
 | `LEGIVIEW_MIN_FREE_SPACE_GB` | `5` | Free space to preserve, in 1024³-byte GB. |
 | `LEGIVIEW_MIN_FREE_SPACE_BYTES` | unset | Deprecated fallback used only when the GB setting is absent. |

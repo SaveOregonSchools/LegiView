@@ -193,6 +193,45 @@ class _StreamMetadata:
     redirects: tuple[str, ...]
 
 
+class _PooledResponse:
+    """Adapt an ``http.client`` response while retaining a reusable connection."""
+
+    def __init__(self, response, url: str, discard: Callable[[], None]) -> None:  # noqa: ANN001
+        self._response = response
+        self._url = url
+        self._discard = discard
+        self.status = int(response.status)
+        self.headers = response.headers
+        self._closed = False
+
+    def geturl(self) -> str:
+        return self._url
+
+    def getcode(self) -> int:
+        return self.status
+
+    def read(self, amount: int = -1) -> bytes:
+        return self._response.read(amount)
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        reusable = not bool(self._response.will_close)
+        if not self._response.isclosed():
+            remaining = self._response.length
+            if remaining is not None and 0 <= remaining <= 64 * 1024:
+                try:
+                    self._response.read()
+                except OSError:
+                    reusable = False
+            else:
+                reusable = False
+        self._response.close()
+        if not reusable:
+            self._discard()
+
+
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, request, response, code, message, headers, new_url):  # noqa: ANN001
         return None
@@ -240,11 +279,90 @@ class SafeHTTPClient:
         ):
             raise ValueError("allowed_ports must contain valid TCP ports")
         self.resolver = resolver
-        self.opener = opener or urllib.request.build_opener(
-            _NoRedirect(),
-            urllib.request.HTTPHandler(),
-            urllib.request.HTTPSHandler(context=ssl.create_default_context()),
-        )
+        # Injected openers retain the original urllib-compatible test/adapter
+        # surface. Production requests use one persistent connection pool per
+        # worker thread so sequential small files reuse TCP and TLS sessions.
+        self.opener = opener
+        self._connections = threading.local()
+        self._ssl_context = ssl.create_default_context()
+
+    def _open(
+        self,
+        url: str,
+        headers: Mapping[str, str],
+        *,
+        method: str = "GET",
+    ):  # noqa: ANN202
+        if self.opener is not None:
+            request = urllib.request.Request(url, method=method, headers=dict(headers))
+            return self.opener.open(request, timeout=self.timeout_seconds)
+
+        parsed = urlsplit(url)
+        scheme = parsed.scheme.casefold()
+        host = str(parsed.hostname)
+        port = parsed.port or (443 if scheme == "https" else 80)
+        origin = (scheme, host.casefold(), port)
+        connections = getattr(self._connections, "values", None)
+        if connections is None:
+            connections = {}
+            self._connections.values = connections
+
+        connection = connections.get(origin)
+        if connection is None:
+            if scheme == "https":
+                connection = http.client.HTTPSConnection(
+                    host, port, timeout=self.timeout_seconds, context=self._ssl_context
+                )
+            else:
+                connection = http.client.HTTPConnection(
+                    host, port, timeout=self.timeout_seconds
+                )
+            connections[origin] = connection
+
+        def discard() -> None:
+            current = connections.pop(origin, None)
+            if current is not None:
+                current.close()
+
+        target = parsed.path or "/"
+        if parsed.query:
+            target += f"?{parsed.query}"
+        try:
+            connection.request(method, target, headers=dict(headers))
+            response = connection.getresponse()
+        except (OSError, TimeoutError, socket.timeout, http.client.HTTPException):
+            discard()
+            raise
+        return _PooledResponse(response, url, discard)
+
+    def open_response(
+        self,
+        url: str,
+        *,
+        method: str = "GET",
+        headers: Mapping[str, str] | None = None,
+    ):  # noqa: ANN201
+        """Open one validated request for callers that handle statuses themselves."""
+
+        self.validate_target(url)
+        outgoing_headers = {
+            "User-Agent": self.user_agent,
+            "Accept": "*/*",
+            **_safe_request_headers(headers or {}),
+        }
+        response = self._open(url, outgoing_headers, method=method)
+        try:
+            reported_url = str(response.geturl())
+            self.validate_target(reported_url)
+            if reported_url != url:
+                raise UnsafeDownloadTarget(
+                    "HTTP opener followed an unexpected redirect before target validation."
+                )
+            self._validate_headers(response.headers)
+            return response
+        except BaseException:
+            response.close()
+            raise
 
     @contextlib.contextmanager
     def open_stream(
@@ -265,50 +383,18 @@ class SafeHTTPClient:
                     "Accept": "*/*",
                     **request_headers,
                 }
-                request = urllib.request.Request(current, method="GET", headers=outgoing_headers)
                 try:
-                    response = self.opener.open(request, timeout=self.timeout_seconds)
+                    response = self._open(current, outgoing_headers)
                 except urllib.error.HTTPError as exc:
-                    status = int(exc.code)
-                    response_headers = exc.headers or {}
-                    if status in REDIRECT_STATUSES:
-                        location = response_headers.get("Location", "")
-                        exc.close()
-                        if not location:
-                            raise DownloadError(
-                                "Redirect response did not provide a Location header.",
-                                status_code=status,
-                                code="invalid_redirect",
-                            ) from None
-                        destination = urljoin(current, location)
-                        if (
-                            _url_origin(current)[0] == "https"
-                            and _url_origin(destination)[0] == "http"
-                            and not self.allow_https_downgrade
-                        ):
-                            raise UnsafeDownloadTarget("HTTPS-to-HTTP redirects are blocked.")
-                        if _url_origin(current) != _url_origin(destination):
-                            request_headers = {
-                                key: value
-                                for key, value in request_headers.items()
-                                if key.casefold() not in {"authorization", "cookie"}
-                            }
-                        current = destination
-                        redirects.append(destination)
-                        if len(redirects) > self.max_redirects:
-                            raise DownloadError("Maximum redirect count exceeded.", code="too_many_redirects")
-                        continue
-                    retryable = status in RETRYABLE_HTTP_STATUSES or 500 <= status <= 599
-                    retry_after = retry_after_seconds(response_headers.get("Retry-After"))
-                    exc.close()
-                    raise NetworkDownloadError(
-                        f"Remote server returned HTTP {status}.",
-                        retryable=retryable,
-                        status_code=status,
-                        retry_after_seconds=retry_after,
-                        code="http_error",
-                    ) from None
-                except (urllib.error.URLError, TimeoutError, socket.timeout, ConnectionError) as exc:
+                    response = exc
+                except (
+                    urllib.error.URLError,
+                    TimeoutError,
+                    socket.timeout,
+                    ConnectionError,
+                    OSError,
+                    http.client.HTTPException,
+                ) as exc:
                     raise NetworkDownloadError(
                         network_error_message(exc),
                         retryable=True,
@@ -326,13 +412,42 @@ class SafeHTTPClient:
                 if raw_status is None:
                     raw_status = response.getcode()
                 status = int(raw_status)
+                if status in REDIRECT_STATUSES:
+                    location = response.headers.get("Location", "")
+                    response.close()
+                    response = None
+                    if not location:
+                        raise DownloadError(
+                            "Redirect response did not provide a Location header.",
+                            status_code=status,
+                            code="invalid_redirect",
+                        )
+                    destination = urljoin(current, location)
+                    if (
+                        _url_origin(current)[0] == "https"
+                        and _url_origin(destination)[0] == "http"
+                        and not self.allow_https_downgrade
+                    ):
+                        raise UnsafeDownloadTarget("HTTPS-to-HTTP redirects are blocked.")
+                    if _url_origin(current) != _url_origin(destination):
+                        request_headers = {
+                            key: value
+                            for key, value in request_headers.items()
+                            if key.casefold() not in {"authorization", "cookie"}
+                        }
+                    current = destination
+                    redirects.append(destination)
+                    continue
                 if not 200 <= status <= 299:
+                    retryable = status in RETRYABLE_HTTP_STATUSES or 500 <= status <= 599
+                    retry_after = retry_after_seconds(response.headers.get("Retry-After"))
                     response.close()
                     response = None
                     raise NetworkDownloadError(
-                        f"Remote server returned unexpected HTTP {status}.",
-                        retryable=500 <= status <= 599,
+                        f"Remote server returned HTTP {status}.",
+                        retryable=retryable,
                         status_code=status,
+                        retry_after_seconds=retry_after,
                         code="http_error",
                     )
                 safe_headers = safe_response_headers(response.headers)
@@ -505,6 +620,8 @@ class Downloader:
         require_https: bool = False,
         allowed_ports: Collection[int] | None = None,
         client: SafeHTTPClient | None = None,
+        calculate_sha256: bool = True,
+        durable_writes: bool = True,
     ) -> None:
         if chunk_size <= 0:
             raise ValueError("chunk_size must be positive")
@@ -524,6 +641,8 @@ class Downloader:
         self.minimum_free_space_bytes = int(minimum_free_space_bytes)
         self.chunk_size = int(chunk_size)
         self.maximum_download_bytes = maximum_download_bytes
+        self.calculate_sha256 = bool(calculate_sha256)
+        self.durable_writes = bool(durable_writes)
 
     def download_to_path(
         self,
@@ -729,7 +848,7 @@ class Downloader:
         advertised_length: int | None = None
         remote_filename = ""
         byte_count = 0
-        digest = hashlib.sha256()
+        digest = hashlib.sha256() if self.calculate_sha256 or expected_sha256.strip() else None
         try:
             with self.client.open_stream(url, headers=headers) as (response, metadata):
                 declared_mime = normalize_mime_type(metadata.headers.get("content-type"))
@@ -786,17 +905,19 @@ class Downloader:
                             grow_reservation(next_count, written_bytes=byte_count)
                             check_free_space(destination, self.minimum_free_space_bytes, len(chunk))
                             handle.write(chunk)
-                            digest.update(chunk)
+                            if digest is not None:
+                                digest.update(chunk)
                             byte_count = next_count
                             grow_reservation(byte_count, written_bytes=byte_count)
-                        handle.flush()
-                        os.fsync(handle.fileno())
+                        if self.durable_writes:
+                            handle.flush()
+                            os.fsync(handle.fileno())
 
             assert metadata is not None and part is not None
             transfer_expected = advertised_length if advertised_length is not None else expected_length
             if transfer_expected is not None and byte_count != transfer_expected:
                 raise ContentLengthMismatch(transfer_expected, byte_count)
-            received_hash = digest.hexdigest()
+            received_hash = digest.hexdigest() if digest is not None else ""
             normalized_expected_hash = expected_sha256.strip().casefold()
             if normalized_expected_hash and received_hash != normalized_expected_hash:
                 raise DownloadHashMismatch(normalized_expected_hash, received_hash)
@@ -847,7 +968,11 @@ class Downloader:
                 raise DestinationConflict(
                     f"Refusing to overwrite an existing file with different bytes: {destination}"
                 )
-            atomic_promote_no_replace(part, destination)
+            atomic_promote_no_replace(
+                part,
+                destination,
+                sync_directory=self.durable_writes,
+            )
             part = None
             part_owned = False
             return DownloadResult(
@@ -899,7 +1024,12 @@ class Downloader:
             raise
 
 
-def atomic_promote_no_replace(part: str | Path, destination: str | Path) -> None:
+def atomic_promote_no_replace(
+    part: str | Path,
+    destination: str | Path,
+    *,
+    sync_directory: bool = True,
+) -> None:
     """Atomically expose staged bytes without replacing an existing file."""
 
     source = Path(part)
@@ -924,7 +1054,8 @@ def atomic_promote_no_replace(part: str | Path, destination: str | Path) -> None
             raise DestinationConflict(f"Destination already exists: {target}") from None
     else:
         source.unlink()
-    _fsync_directory(target.parent)
+    if sync_directory:
+        _fsync_directory(target.parent)
 
 
 def retry_delay_seconds(error: DownloadError, attempt: int, policy: RetryPolicy | None = None) -> float:
@@ -1105,7 +1236,11 @@ def _extension_hint(mime_type: str) -> str:
 
 def _existing_file_matches(path: Path, expected_hash: str, expected_size: int) -> bool:
     try:
-        return path.is_file() and path.stat().st_size == expected_size and sha256_file(path) == expected_hash
+        return bool(
+            path.is_file()
+            and path.stat().st_size == expected_size
+            and (not expected_hash or sha256_file(path) == expected_hash)
+        )
     except OSError:
         return False
 
