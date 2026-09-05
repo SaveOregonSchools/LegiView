@@ -130,14 +130,14 @@
     {% if recent_runs %}
       <div class="table-scroll">
         <table>
-          <thead><tr><th>Run</th><th>Type</th><th>Scope</th><th>Status</th><th>Stage</th><th>Documents</th><th>Errors</th><th>Started</th></tr></thead>
+          <thead><tr><th>Run</th><th>Type</th><th>Scope</th><th class="recent-run-status">Status</th><th>Stage</th><th>Documents</th><th>Errors</th><th>Started</th></tr></thead>
           <tbody>
             {% for run in recent_runs %}
               <tr>
                 <td><a href="{{ url_for('run_detail', run_id=run.id) }}">#{{ run.id }}</a></td>
                 <td>{{ run.run_type or run.type or '—' }}</td>
                 <td>{{ run.scope_display or run.requested_scope or '—' }}</td>
-                <td><span class="status {{ run.status }}">{{ (run.status or 'unknown')|replace('_', ' ') }}</span></td>
+                <td class="recent-run-status"><span class="status {{ run.status }}">{{ (run.status or 'unknown')|replace('_', ' ') }}</span></td>
                 <td>{{ (run.stage or '—')|replace('_', ' ') }}</td>
                 <td>{{ run.documents_downloaded or 0 }} / {{ run.documents_discovered or 0 }}</td>
                 <td>{{ run.error_count or run.errors or 0 }}</td>

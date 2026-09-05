@@ -887,6 +887,14 @@ td {
   max-width: 520px;
 }
 
+.recent-run-status {
+  min-width: 120px;
+}
+
+.recent-run-status .status {
+  white-space: nowrap;
+}
+
 .documents-table {
   table-layout: fixed;
   min-width: 1120px;
