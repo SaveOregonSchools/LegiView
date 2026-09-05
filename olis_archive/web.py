@@ -253,7 +253,8 @@ def create_app(config_overrides: dict | None = None) -> Flask:
     @app.get("/")
     def home():
         active, _ = current()
-        raw_stats = ArchiveQueries(active.database).dashboard_stats()
+        queries = ArchiveQueries(active.database)
+        raw_stats = queries.dashboard_stats()
         stats = {
             "sessions": raw_stats.get("sessions_in_scope", 0),
             "sessions_complete": raw_stats.get("sessions_inventory_complete", 0),
@@ -273,7 +274,10 @@ def create_app(config_overrides: dict | None = None) -> Flask:
                 raw_stats.get("last_historical_inventory")
             ),
         }
-        recent = [_present_run(row) for row in active.collection.runs.list_runs(8)]
+        recent = [
+            _present_run(row, queries=queries)
+            for row in active.collection.runs.list_runs(8)
+        ]
         return render_template("home.html", stats=stats, recent_runs=recent)
 
     @app.route("/collect/bill", methods=["GET", "POST"])
@@ -845,20 +849,21 @@ def create_app(config_overrides: dict | None = None) -> Flask:
     @app.get("/runs")
     def runs():
         active, _ = current()
+        queries = ArchiveQueries(active.database)
         filters = SimpleNamespace(
             run_type=request.args.get("run_type", "").strip(),
             status=request.args.get("status", "").strip(),
             scope=request.args.get("scope", "").strip().casefold(),
         )
         page = _page_number(request.args.get("page"))
-        result = ArchiveQueries(active.database).runs(
+        result = queries.runs(
             run_type=filters.run_type or None,
             status=filters.status or None,
             scope=filters.scope or None,
             limit=PAGE_SIZE,
             offset=(page - 1) * PAGE_SIZE,
         )
-        rows = [_present_run(row) for row in result.rows]
+        rows = [_present_run(row, queries=queries) for row in result.rows]
         return render_template(
             "runs.html",
             filters=filters,
@@ -871,12 +876,26 @@ def create_app(config_overrides: dict | None = None) -> Flask:
             ),
         )
 
-    @app.get("/runs/<int:run_id>")
+    @app.route("/runs/<int:run_id>", methods=["GET", "POST"])
     def run_detail(run_id: int):
         active, _ = current()
         run = active.collection.runs.get_run(run_id)
         if run is None:
             abort(404)
+        if request.method == "POST":
+            try:
+                refresh_seconds = int(request.form.get("refresh_seconds", ""))
+                if not 0 <= refresh_seconds <= 900:
+                    raise ValueError
+            except ValueError:
+                flash("Refresh rate must be a whole number from 0 to 900 seconds.", "error")
+            else:
+                session["run_refresh_seconds"] = refresh_seconds
+            return redirect(url_for(
+                "run_detail", run_id=run_id,
+                item_page=_page_number(request.form.get("item_page")),
+                error_page=_page_number(request.form.get("error_page")),
+            ), code=303)
         queries = ArchiveQueries(active.database)
         item_page_number = _page_number(request.args.get("item_page"))
         error_page_number = _page_number(request.args.get("error_page"))
@@ -892,7 +911,7 @@ def create_app(config_overrides: dict | None = None) -> Flask:
         )
         stages = [_present_stage(item) for item in queries.run_stages(run_id)]
         work_items = [_present_run_item(active, item) for item in item_page.rows]
-        presented = _present_run(run)
+        presented = _present_run(run, queries=queries)
         # Keep the summary count identical to the Operations view linked from
         # this page: anomalies qualify when this run first or most recently
         # observed them.
@@ -930,6 +949,7 @@ def create_app(config_overrides: dict | None = None) -> Flask:
             },
             config_snapshot=_json_dict(run.get("config_snapshot_json")),
             elapsed=_elapsed(run),
+            refresh_seconds=session.get("run_refresh_seconds", 15),
         )
 
     @app.post("/runs/<int:run_id>/pause")
@@ -1232,9 +1252,19 @@ def _present_sponsor(row: Mapping[str, Any]) -> dict[str, Any]:
     return result
 
 
-def _present_run(row: Mapping[str, Any]) -> dict[str, Any]:
+def _present_run(
+    row: Mapping[str, Any], *, queries: ArchiveQueries | None = None
+) -> dict[str, Any]:
     result = dict(row)
     scope = _json_dict(row.get("requested_scope_json"))
+    if row.get("run_type") == "download_archive" and queries is not None:
+        result.update(queries.download_run_counts(int(row["id"])))
+        preflight = scope.get("preflight") or {}
+        selected = int(preflight.get("pending_or_missing") or 0)
+        if not scope.get("retryable_failures_only"):
+            selected += int(preflight.get("already_downloaded") or 0)
+        result["documents_discovered"] = max(selected, result["documents_recorded"])
+        row = result
     session = row.get("requested_session_key") or scope.get("session_key")
     bill = row.get("requested_bill_id_compact") or scope.get("bill_id_compact")
     source_run = scope.get("source_run_id")
@@ -1565,6 +1595,8 @@ def _pagination(
         prev_url=previous_url,
         previous_url=previous_url,
         next_url=next_url,
+        first_url=page_url(1) if page > 1 else None,
+        last_url=page_url(pages) if pages and page < pages else None,
     )
 
 

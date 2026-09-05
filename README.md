@@ -240,6 +240,18 @@ In the UI:
 4. Press **Start Download Archive** explicitly.
 5. Use Run Detail to pause, cancel, or resume. Completed files are always retained.
 
+Run Detail accepts a refresh interval of 0–900 whole seconds; save 0 to turn off
+automatic refresh. The preference applies to run pages in the current browser
+session, and refresh pauses while editing it. Run Items provides First/Previous
+and Next/Last navigation.
+
+Download Archive progress reads the latest saved document outcomes while workers
+are running, including on the dashboard and Run History. **Documents selected**
+uses the saved preflight count of pending downloads plus recorded files to validate
+(pending failures only for retry runs). Downloaded, skipped, and failed counts each
+count documents once, even after retry/resume. Session totals are finalized when
+the download workers finish.
+
 From the CLI, first inspect the same scope without mutating it, then start the run:
 
 ```powershell

@@ -887,6 +887,50 @@ td {
   max-width: 520px;
 }
 
+.documents-table {
+  table-layout: fixed;
+  min-width: 1120px;
+}
+
+.documents-table th {
+  height: 72px;
+  vertical-align: middle;
+  white-space: normal;
+}
+
+.documents-table .title-cell {
+  min-width: 0;
+  max-width: none;
+}
+
+.documents-table .document-measure { width: 8%; }
+.documents-table .document-kind { width: 9%; }
+.documents-table .document-title { width: 18%; }
+.documents-table .document-submitter { width: 11%; }
+.documents-table .document-committee { width: 12%; }
+.documents-table .document-position { width: 8%; }
+.documents-table .document-presence { width: 11%; }
+.documents-table .document-download { width: 15%; }
+.documents-table .document-size { width: 8%; }
+
+.documents-table .position,
+.documents-table .status {
+  white-space: nowrap;
+  overflow-wrap: normal;
+}
+
+.run-refresh-form {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: end;
+  gap: 10px;
+  margin: 14px 0;
+}
+
+.run-refresh-form input[type="number"] {
+  width: 110px;
+}
+
 .key-table th {
   width: 180px;
   white-space: normal;

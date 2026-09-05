@@ -8,6 +8,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from bs4 import BeautifulSoup
 
 from olis_archive import create_app
 from olis_archive.services.archive_queries import ArchiveQueries
@@ -117,6 +118,113 @@ def _seed_document(runtime, bill_id: int, source_id: str, **values) -> int:  # n
     }
     fields.update(values)
     return runtime.storage.upsert_document(fields)
+
+
+@pytest.mark.parametrize("retry_only,selected", [(False, 12), (True, 9)])
+def test_archive_progress_reads_live_ledger_with_stale_run_header(
+    phase2_app, retry_only, selected
+):
+    runtime = phase2_app.extensions["legiview"]["runtime"]
+    _, bill_id = _seed_scope(runtime)
+    runs = runtime.collection.runs
+    run_id = runs.create_run(
+        "download_archive", session_keys=["2026R1"],
+        scope={"retryable_failures_only": retry_only,
+               "preflight": {"pending_or_missing": 9, "already_downloaded": 3}},
+    )
+    assert runs.claim_run(run_id)
+    document_ids = []
+    for index, status in enumerate([
+        "completed", "completed", "skipped", "failed_retryable", "failed_terminal", "running"
+    ]):
+        document_id = _seed_document(runtime, bill_id, f"progress-{index}")
+        document_ids.append(document_id)
+        runs.begin_stage(
+            run_id, "download_archive", "Fixture transfer", item_type="document",
+            item_key=f"document:{document_id}", document_id=document_id, bill_id=bill_id,
+            session_key="2026R1",
+        )
+        if status != "running":
+            runs.mark_document_item(run_id, document_id, status)
+    runs.set_counters(run_id, bytes_downloaded=2048)
+    assert runs.get_run(run_id)["documents_downloaded"] == 0
+
+    client = phase2_app.test_client()
+    def stats():
+        page = BeautifulSoup(client.get(f"/runs/{run_id}").data, "html.parser")
+        return {card.select_one(".stat-label").get_text(strip=True):
+                card.select_one("strong").get_text(strip=True)
+                for card in page.select(".stat")}
+
+    values = stats()
+    assert values["Documents selected"] == str(selected)
+    assert values["Documents downloaded"] == "2"
+    assert values["Skipped valid"] == "1"
+    assert values["Documents failed"] == "2"
+    assert values["Bytes downloaded"] == "2.0 KiB"
+    for url in ["/", "/runs"]:
+        page = BeautifulSoup(client.get(url).data, "html.parser")
+        row = page.find("a", href=f"/runs/{run_id}").find_parent("tr")
+        assert f"2 / {selected}" in row.get_text(" ", strip=True)
+
+    # A retry changes the outcome of the same item; it must not count twice.
+    runs.mark_document_item(run_id, document_ids[3], "completed")
+    assert stats()["Documents downloaded"] == "3"
+    assert stats()["Documents failed"] == "1"
+    assert runs.get_run(run_id)["documents_downloaded"] == 0  # Reads do not mutate the run.
+
+
+def test_run_refresh_validation_persistence_and_item_page_boundaries(phase2_app):
+    runtime = phase2_app.extensions["legiview"]["runtime"]
+    runs = runtime.collection.runs
+    run_id = runs.create_run("download_archive", session_keys=["2026R1"])
+    assert runs.claim_run(run_id)
+    for index in range(101):
+        runs.begin_stage(
+            run_id, "download_archive", "Fixture item", item_type="document",
+            item_key=f"fixture:{index}",
+        )
+    client = phase2_app.test_client()
+    token = _csrf(client)
+    assert client.post(f"/runs/{run_id}", data={"refresh_seconds": "0"}).status_code == 400
+    for seconds in [0, 900, 1, 37]:
+        response = client.post(f"/runs/{run_id}", data={
+            "_csrf_token": token, "refresh_seconds": str(seconds),
+            "item_page": "2", "error_page": "3",
+        }, follow_redirects=True)
+        page = BeautifulSoup(response.data, "html.parser")
+        assert page.select_one("#run-refresh-form")["data-refresh-seconds"] == str(seconds)
+        assert page.select_one("#refresh-seconds")["value"] == str(seconds)
+        assert page.select_one('input[name="item_page"]')["value"] == "2"
+        assert page.select_one('input[name="error_page"]')["value"] == "3"
+    for invalid in ["-1", "901", "1.5", "", "abc"]:
+        response = client.post(f"/runs/{run_id}", data={
+            "_csrf_token": token, "refresh_seconds": invalid,
+        }, follow_redirects=True)
+        assert b"whole number from 0 to 900" in response.data
+        with client.session_transaction() as saved:
+            assert saved["run_refresh_seconds"] == 37
+
+    for number in [1, 2, 3]:
+        page = BeautifulSoup(client.get(
+            f"/runs/{run_id}?item_page={number}&error_page=3"
+        ).data, "html.parser")
+        nav = page.select_one('nav[aria-label="Run item pages"]')
+        controls = {el.get_text(strip=True): el for el in nav.select("a, button")}
+        assert list(controls) == ["First", "Previous", "Next", "Last"]
+        if number > 1:
+            assert controls["First"]["href"] == f"/runs/{run_id}?error_page=3&item_page=1"
+        else:
+            assert controls["First"].has_attr("disabled")
+        if number < 3:
+            assert controls["Last"]["href"] == f"/runs/{run_id}?error_page=3&item_page=3"
+        else:
+            assert controls["Last"].has_attr("disabled")
+
+    runs.finish_run(run_id)
+    page = BeautifulSoup(client.get(f"/runs/{run_id}").data, "html.parser")
+    assert page.select_one("#run-refresh-form")["data-refresh-seconds"] == "0"
+    assert page.select_one("#refresh-seconds")["value"] == "37"
 
 
 @pytest.mark.parametrize(
